@@ -1,0 +1,25 @@
+# Tastytrade Trading Bot Dependencies
+
+# Choose ONE of these Tastytrade SDKs:
+
+# Option 1: Official Tastytrade SDK
+# tastytrade-sdk>=1.2.0
+
+# Option 2: Community SDK (more features, well-maintained)
+tastytrade>=11.0.0
+
+# Core dependencies (included with tastytrade package)
+# pydantic>=2.0.0
+# httpx>=0.24.0
+# websockets>=11.0
+
+# Optional: For enhanced functionality
+python-dateutil>=2.8.0
+pytz>=2023.3
+python-dotenv>=1.0.0  # Load credentials from .env file
+
+# Development dependencies
+# pytest>=7.0.0
+# pytest-asyncio>=0.21.0
+# black>=23.0.0
+# mypy>=1.0.0

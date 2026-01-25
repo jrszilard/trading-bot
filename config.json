@@ -1,0 +1,226 @@
+{
+  "bot_settings": {
+    "sandbox_mode": true,
+    "auto_manage_positions": true,
+    "scan_interval_minutes": 15,
+    "management_check_interval_minutes": 60
+  },
+  
+  "risk_parameters": {
+    "_comment": "All monetary values in USD, percentages as decimals",
+    
+    "loss_limits": {
+      "max_daily_loss": 500.00,
+      "max_weekly_loss": 1500.00,
+      "max_monthly_loss": 3000.00,
+      "max_position_loss": 300.00,
+      "max_portfolio_drawdown_percent": 0.10
+    },
+    
+    "position_sizing": {
+      "_comment": "Tastylive recommends: trade small and often",
+      "max_position_size_percent": 0.05,
+      "max_total_positions": 15,
+      "max_positions_per_underlying": 2,
+      "min_credit_per_contract": 0.50
+    },
+    
+    "buying_power": {
+      "min_buying_power_reserve_percent": 0.30,
+      "max_buying_power_usage_percent": 0.50
+    },
+    
+    "portfolio_greeks": {
+      "_comment": "Beta-weighted to SPY",
+      "max_portfolio_delta": 300,
+      "max_portfolio_theta": -50,
+      "max_portfolio_vega": 500
+    }
+  },
+  
+  "entry_criteria": {
+    "_comment": "Tastylive methodology for trade entry",
+    
+    "iv_requirements": {
+      "min_iv_rank": 30,
+      "preferred_iv_rank": 50,
+      "max_iv_rank": 90
+    },
+    
+    "dte_requirements": {
+      "_comment": "Tastylive standard: enter at 45 DTE",
+      "target_dte": 45,
+      "min_dte": 30,
+      "max_dte": 60
+    },
+    
+    "delta_targets": {
+      "_comment": "30 delta for standard, 16 delta for conservative",
+      "standard_delta": 0.30,
+      "conservative_delta": 0.16,
+      "aggressive_delta": 0.40
+    },
+    
+    "probability_requirements": {
+      "min_probability_otm": 0.65,
+      "min_probability_50_profit": 0.70
+    },
+    
+    "liquidity_requirements": {
+      "min_open_interest": 100,
+      "max_bid_ask_spread_percent": 0.10
+    }
+  },
+  
+  "management_rules": {
+    "_comment": "Tastylive position management methodology",
+    
+    "profit_taking": {
+      "_comment": "Take profit at 50% of max premium",
+      "profit_target_percent": 0.50,
+      "early_profit_target_percent": 0.25,
+      "early_profit_dte_threshold": 30
+    },
+    
+    "loss_management": {
+      "_comment": "Stop loss when debit equals 2x credit received",
+      "stop_loss_multiplier": 2.0,
+      "max_loss_percent_of_credit": 2.0
+    },
+    
+    "dte_management": {
+      "_comment": "Roll or close at 21 DTE to reduce gamma risk",
+      "management_dte": 21,
+      "close_dte": 7,
+      "never_hold_to_expiration": true
+    },
+    
+    "rolling_rules": {
+      "roll_same_strike": true,
+      "roll_to_next_monthly": true,
+      "min_credit_for_roll": 0.25,
+      "max_rolls_per_position": 3
+    },
+    
+    "tested_position_rules": {
+      "_comment": "When strike is breached (position tested)",
+      "roll_when_tested": true,
+      "add_opposite_side": false,
+      "reduce_position_size": true
+    }
+  },
+  
+  "strategy_preferences": {
+    "_comment": "Preferred strategies based on market conditions",
+    
+    "high_iv_strategies": [
+      "short_strangle",
+      "iron_condor",
+      "short_put"
+    ],
+    
+    "neutral_strategies": [
+      "iron_condor",
+      "short_strangle",
+      "short_straddle"
+    ],
+    
+    "bullish_strategies": [
+      "short_put",
+      "short_put_spread",
+      "covered_call"
+    ],
+    
+    "bearish_strategies": [
+      "short_call",
+      "short_call_spread"
+    ],
+    
+    "default_strategy": "short_put_spread"
+  },
+  
+  "watchlist": {
+    "_comment": "Symbols to scan for opportunities",
+    
+    "index_etfs": [
+      "SPY",
+      "QQQ", 
+      "IWM",
+      "DIA"
+    ],
+    
+    "sector_etfs": [
+      "XLF",
+      "XLE",
+      "XLK",
+      "XLV",
+      "XLI",
+      "XLP",
+      "XLU",
+      "XLB",
+      "XLRE"
+    ],
+    
+    "high_iv_stocks": [
+      "AAPL",
+      "MSFT",
+      "GOOGL",
+      "AMZN",
+      "META",
+      "NVDA",
+      "TSLA",
+      "AMD"
+    ],
+    
+    "excluded_symbols": []
+  },
+  
+  "approval_workflow": {
+    "_comment": "CRITICAL: Trades require approval before execution",
+    
+    "require_approval": true,
+    "approval_methods": ["cli", "webhook", "email"],
+    "approval_timeout_hours": 24,
+    
+    "auto_approve_conditions": {
+      "_comment": "DISABLED by default - enable with caution",
+      "enabled": false,
+      "max_position_loss": 100.00,
+      "max_contracts": 1,
+      "only_defined_risk": true
+    },
+    
+    "notifications": {
+      "notify_on_proposal": true,
+      "notify_on_execution": true,
+      "notify_on_management": true,
+      "notify_on_stop_loss": true
+    }
+  },
+  
+  "api_settings": {
+    "_comment": "Tastytrade API configuration",
+    
+    "environment": "sandbox",
+    "sandbox_url": "https://api.cert.tastyworks.com",
+    "production_url": "https://api.tastyworks.com",
+    
+    "rate_limits": {
+      "requests_per_second": 5,
+      "requests_per_minute": 120
+    },
+    
+    "streaming": {
+      "reconnect_on_disconnect": true,
+      "heartbeat_interval_seconds": 30
+    }
+  },
+  
+  "logging": {
+    "level": "INFO",
+    "log_to_file": true,
+    "log_file_path": "trading_bot.log",
+    "log_trades": true,
+    "log_portfolio_state": true
+  }
+}
