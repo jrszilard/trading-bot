@@ -8,16 +8,285 @@ APIs are unavailable (e.g., sandbox mode without DXLink access).
 This allows testing the full bot workflow:
 - Market data (IV rank, option chains, Greeks, quotes) uses mock data
 - Order execution uses real Tastytrade sandbox API
+
+Supports Brave Search API for dynamic real-time data fetching.
 """
 
 import math
-from dataclasses import dataclass
-from datetime import date, timedelta
+import os
+import re
+import json
+import asyncio
+from dataclasses import dataclass, field
+from datetime import date, datetime, timedelta
 from decimal import Decimal
 from typing import Dict, List, Optional, Any
 import logging
 
+# HTTP client for Brave Search API
+try:
+    import httpx
+    HTTPX_AVAILABLE = True
+except ImportError:
+    HTTPX_AVAILABLE = False
+
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class CachedData:
+    """Cache entry for market data"""
+    data: Dict[str, Any]
+    timestamp: datetime
+    ttl_seconds: int = 300  # 5 minute default TTL
+
+    def is_expired(self) -> bool:
+        return (datetime.now() - self.timestamp).total_seconds() > self.ttl_seconds
+
+
+class BraveSearchClient:
+    """
+    Client for Brave Search API to fetch real-time market data.
+
+    Uses Brave Search to get current stock prices, IV rank estimates,
+    and other market information for more realistic mock data.
+    """
+
+    BRAVE_API_URL = "https://api.search.brave.com/res/v1/web/search"
+
+    def __init__(self, api_key: Optional[str] = None, cache_ttl: int = 300):
+        """
+        Initialize Brave Search client.
+
+        Args:
+            api_key: Brave Search API key (or set BRAVE_API_KEY env var)
+            cache_ttl: Cache time-to-live in seconds (default 5 minutes)
+        """
+        self.api_key = api_key or os.environ.get('BRAVE_API_KEY')
+        self.cache_ttl = cache_ttl
+        self._cache: Dict[str, CachedData] = {}
+        self._client: Optional['httpx.AsyncClient'] = None
+
+        if not HTTPX_AVAILABLE:
+            logger.warning("httpx not available - Brave Search disabled. Install with: pip install httpx")
+        elif not self.api_key:
+            logger.info("No BRAVE_API_KEY found - using static mock data only")
+
+    @property
+    def is_available(self) -> bool:
+        """Check if Brave Search is available"""
+        return HTTPX_AVAILABLE and bool(self.api_key)
+
+    async def _get_client(self) -> 'httpx.AsyncClient':
+        """Get or create HTTP client"""
+        if self._client is None:
+            self._client = httpx.AsyncClient(timeout=10.0)
+        return self._client
+
+    async def close(self):
+        """Close the HTTP client"""
+        if self._client:
+            await self._client.aclose()
+            self._client = None
+
+    async def search(self, query: str) -> Optional[Dict[str, Any]]:
+        """
+        Perform a Brave Search query.
+
+        Args:
+            query: The search query
+
+        Returns:
+            Search results dict or None if failed
+        """
+        if not self.is_available:
+            return None
+
+        # Check cache
+        cache_key = query.lower()
+        if cache_key in self._cache and not self._cache[cache_key].is_expired():
+            logger.debug(f"Cache hit for query: {query}")
+            return self._cache[cache_key].data
+
+        try:
+            client = await self._get_client()
+            response = await client.get(
+                self.BRAVE_API_URL,
+                params={
+                    "q": query,
+                    "count": 5,
+                    "safesearch": "off",
+                    "freshness": "pd"  # Past day for fresh data
+                },
+                headers={
+                    "Accept": "application/json",
+                    "X-Subscription-Token": self.api_key
+                }
+            )
+
+            if response.status_code == 200:
+                data = response.json()
+                self._cache[cache_key] = CachedData(
+                    data=data,
+                    timestamp=datetime.now(),
+                    ttl_seconds=self.cache_ttl
+                )
+                return data
+            else:
+                logger.warning(f"Brave Search API error: {response.status_code}")
+                return None
+
+        except Exception as e:
+            logger.error(f"Brave Search request failed: {e}")
+            return None
+
+    async def get_stock_price(self, symbol: str) -> Optional[float]:
+        """
+        Get current stock price via Brave Search.
+
+        Args:
+            symbol: Stock ticker symbol
+
+        Returns:
+            Current price or None if not found
+        """
+        query = f"{symbol} stock price today"
+        results = await self.search(query)
+
+        if not results:
+            return None
+
+        # Try to extract price from search results
+        price = self._extract_price_from_results(results, symbol)
+        if price:
+            logger.info(f"Brave Search: {symbol} price = ${price}")
+        return price
+
+    async def get_market_data(self, symbol: str) -> Dict[str, Any]:
+        """
+        Get comprehensive market data for a symbol via Brave Search.
+
+        Args:
+            symbol: Stock ticker symbol
+
+        Returns:
+            Dict with price, iv_rank estimate, and other data
+        """
+        data = {
+            "symbol": symbol,
+            "price": None,
+            "iv_rank": None,
+            "change_pct": None,
+            "source": "brave_search"
+        }
+
+        # Get price
+        price = await self.get_stock_price(symbol)
+        if price:
+            data["price"] = price
+
+        # Get IV rank (search for implied volatility info)
+        iv_data = await self._get_iv_data(symbol)
+        if iv_data:
+            data.update(iv_data)
+
+        return data
+
+    async def _get_iv_data(self, symbol: str) -> Optional[Dict[str, Any]]:
+        """Get implied volatility data from search"""
+        query = f"{symbol} implied volatility IV rank options"
+        results = await self.search(query)
+
+        if not results:
+            return None
+
+        iv_rank = self._extract_iv_from_results(results, symbol)
+        if iv_rank is not None:
+            logger.info(f"Brave Search: {symbol} IV rank estimate = {iv_rank}")
+            return {"iv_rank": iv_rank}
+
+        return None
+
+    def _extract_price_from_results(
+        self,
+        results: Dict[str, Any],
+        symbol: str
+    ) -> Optional[float]:
+        """Extract stock price from Brave Search results"""
+        # Check for infobox (often contains stock data)
+        if "infobox" in results:
+            infobox = results["infobox"]
+            # Look for price in infobox data
+            if "results" in infobox:
+                for item in infobox["results"]:
+                    if "stock" in str(item).lower() or "price" in str(item).lower():
+                        price = self._parse_price(str(item))
+                        if price:
+                            return price
+
+        # Search through web results
+        web_results = results.get("web", {}).get("results", [])
+        for result in web_results:
+            title = result.get("title", "")
+            description = result.get("description", "")
+            text = f"{title} {description}"
+
+            # Look for price patterns
+            price = self._parse_price(text)
+            if price and 1 < price < 10000:  # Sanity check
+                return price
+
+        return None
+
+    def _extract_iv_from_results(
+        self,
+        results: Dict[str, Any],
+        symbol: str
+    ) -> Optional[float]:
+        """Extract IV rank from Brave Search results"""
+        web_results = results.get("web", {}).get("results", [])
+
+        for result in web_results:
+            title = result.get("title", "")
+            description = result.get("description", "")
+            text = f"{title} {description}".lower()
+
+            # Look for IV rank patterns
+            iv_patterns = [
+                r'iv\s*rank[:\s]+(\d+(?:\.\d+)?)\s*%?',
+                r'iv\s*percentile[:\s]+(\d+(?:\.\d+)?)\s*%?',
+                r'implied\s*volatility\s*rank[:\s]+(\d+(?:\.\d+)?)',
+                r'(\d+(?:\.\d+)?)\s*%?\s*iv\s*rank',
+            ]
+
+            for pattern in iv_patterns:
+                match = re.search(pattern, text)
+                if match:
+                    iv_rank = float(match.group(1))
+                    if 0 <= iv_rank <= 100:
+                        return iv_rank
+
+        return None
+
+    def _parse_price(self, text: str) -> Optional[float]:
+        """Parse a price from text"""
+        # Common price patterns
+        patterns = [
+            r'\$\s*(\d+(?:,\d{3})*(?:\.\d{2})?)',  # $123.45 or $1,234.56
+            r'(?:price|trading at|at)\s*\$?\s*(\d+(?:,\d{3})*(?:\.\d{2})?)',
+            r'(\d+(?:\.\d{2})?)\s*(?:usd|dollars)',
+        ]
+
+        for pattern in patterns:
+            match = re.search(pattern, text.lower())
+            if match:
+                price_str = match.group(1).replace(',', '')
+                try:
+                    return float(price_str)
+                except ValueError:
+                    continue
+
+        return None
 
 
 @dataclass
@@ -109,7 +378,139 @@ class MockDataProvider:
         self.default_bid_ask_spread_pct = mock_config.get('default_bid_ask_spread_pct', 0.03)
         self.default_iv_rank = mock_config.get('default_iv_rank', 35)
 
-        logger.info(f"MockDataProvider initialized with {len(self.symbols)} symbols")
+        # Initialize Brave Search client for dynamic data
+        brave_config = mock_config.get('brave_search', {})
+        self.use_brave_search = brave_config.get('enabled', True)
+        cache_ttl = brave_config.get('cache_ttl_seconds', 300)
+
+        self.brave_client = BraveSearchClient(
+            api_key=brave_config.get('api_key'),
+            cache_ttl=cache_ttl
+        )
+
+        # Cache for dynamically fetched data
+        self._dynamic_cache: Dict[str, CachedData] = {}
+
+        mode = "Brave Search enabled" if self.brave_client.is_available else "static data only"
+        logger.info(f"MockDataProvider initialized with {len(self.symbols)} symbols ({mode})")
+
+    def get_symbol_data(self, symbol: str) -> Dict[str, Any]:
+        """
+        Get symbol data, using cached dynamic data if available.
+
+        This is a synchronous method that returns cached data.
+        Use refresh_symbol_data() to fetch fresh data from Brave Search.
+
+        Args:
+            symbol: Stock ticker symbol
+
+        Returns:
+            Dict with price, iv_rank, beta, and option_strike_interval
+        """
+        # Check dynamic cache first
+        if symbol in self._dynamic_cache and not self._dynamic_cache[symbol].is_expired():
+            return self._dynamic_cache[symbol].data
+
+        # Fall back to static data
+        static_data = self.symbols.get(symbol, {})
+        return {
+            'symbol': symbol,
+            'price': static_data.get('price', 100.0),
+            'iv_rank': static_data.get('iv_rank', self.default_iv_rank),
+            'beta': static_data.get('beta', 1.0),
+            'option_strike_interval': static_data.get('option_strike_interval', 1.0),
+            'source': 'static'
+        }
+
+    async def refresh_symbol_data(self, symbol: str) -> Dict[str, Any]:
+        """
+        Fetch fresh market data for a symbol using Brave Search.
+
+        Args:
+            symbol: Stock ticker symbol
+
+        Returns:
+            Dict with price, iv_rank, and other market data
+        """
+        # Get static defaults
+        static_data = self.symbols.get(symbol, {})
+        result = {
+            'symbol': symbol,
+            'price': static_data.get('price', 100.0),
+            'iv_rank': static_data.get('iv_rank', self.default_iv_rank),
+            'beta': static_data.get('beta', 1.0),
+            'option_strike_interval': static_data.get('option_strike_interval', 1.0),
+            'source': 'static'
+        }
+
+        # Try Brave Search if available
+        if self.use_brave_search and self.brave_client.is_available:
+            try:
+                brave_data = await self.brave_client.get_market_data(symbol)
+
+                if brave_data.get('price'):
+                    result['price'] = brave_data['price']
+                    result['source'] = 'brave_search'
+
+                    # Update strike interval based on price
+                    result['option_strike_interval'] = self._calculate_strike_interval(brave_data['price'])
+
+                if brave_data.get('iv_rank') is not None:
+                    result['iv_rank'] = brave_data['iv_rank']
+
+                logger.info(f"Refreshed {symbol} data from Brave Search: price=${result['price']}, IV={result['iv_rank']}")
+
+            except Exception as e:
+                logger.warning(f"Brave Search failed for {symbol}, using static data: {e}")
+
+        # Cache the result
+        self._dynamic_cache[symbol] = CachedData(
+            data=result,
+            timestamp=datetime.now(),
+            ttl_seconds=300
+        )
+
+        return result
+
+    async def refresh_all_symbols(self, symbols: List[str]) -> Dict[str, Dict[str, Any]]:
+        """
+        Refresh data for multiple symbols concurrently.
+
+        Args:
+            symbols: List of ticker symbols
+
+        Returns:
+            Dict mapping symbols to their market data
+        """
+        tasks = [self.refresh_symbol_data(symbol) for symbol in symbols]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        data = {}
+        for symbol, result in zip(symbols, results):
+            if isinstance(result, Exception):
+                logger.warning(f"Failed to refresh {symbol}: {result}")
+                data[symbol] = self.get_symbol_data(symbol)
+            else:
+                data[symbol] = result
+
+        return data
+
+    def _calculate_strike_interval(self, price: float) -> float:
+        """Calculate appropriate option strike interval based on price"""
+        if price < 25:
+            return 0.5
+        elif price < 50:
+            return 1.0
+        elif price < 200:
+            return 2.5
+        elif price < 500:
+            return 5.0
+        else:
+            return 10.0
+
+    async def close(self):
+        """Close any open connections"""
+        await self.brave_client.close()
 
     def get_market_metrics(self, symbols: List[str]) -> List[MockMetric]:
         """
@@ -123,16 +524,35 @@ class MockDataProvider:
         """
         metrics = []
         for symbol in symbols:
-            data = self.symbols.get(symbol, {})
+            # Use get_symbol_data which checks dynamic cache first
+            data = self.get_symbol_data(symbol)
             metric = MockMetric(
                 symbol=symbol,
                 implied_volatility_index_rank=data.get('iv_rank', self.default_iv_rank),
                 beta=data.get('beta', 1.0)
             )
             metrics.append(metric)
-            logger.debug(f"Mock metric for {symbol}: IV Rank={metric.implied_volatility_index_rank}, Beta={metric.beta}")
+            source = data.get('source', 'static')
+            logger.debug(f"Mock metric for {symbol}: IV Rank={metric.implied_volatility_index_rank}, Beta={metric.beta} [{source}]")
 
         return metrics
+
+    async def get_market_metrics_async(self, symbols: List[str]) -> List[MockMetric]:
+        """
+        Get market metrics for symbols, refreshing from Brave Search if available.
+
+        Args:
+            symbols: List of ticker symbols
+
+        Returns:
+            List of MockMetric objects with IV rank and beta
+        """
+        # Refresh data from Brave Search
+        if self.brave_client.is_available:
+            await self.refresh_all_symbols(symbols)
+
+        # Return the metrics (now with fresh data in cache)
+        return self.get_market_metrics(symbols)
 
     def get_option_chain(
         self,
@@ -149,7 +569,7 @@ class MockDataProvider:
         Returns:
             Dict mapping expiration dates to lists of MockOption objects
         """
-        data = self.symbols.get(symbol, {})
+        data = self.get_symbol_data(symbol)
         price = data.get('price', 100.0)
         strike_interval = data.get('option_strike_interval', 1.0)
 
@@ -318,8 +738,14 @@ class MockDataProvider:
 
     def get_underlying_price(self, symbol: str) -> float:
         """Get the mock price for an underlying symbol."""
-        data = self.symbols.get(symbol, {})
+        data = self.get_symbol_data(symbol)
         return data.get('price', 100.0)
+
+    async def get_underlying_price_async(self, symbol: str) -> float:
+        """Get the price for an underlying symbol, refreshing from Brave Search."""
+        if self.brave_client.is_available:
+            await self.refresh_symbol_data(symbol)
+        return self.get_underlying_price(symbol)
 
     def _create_mock_option(
         self,

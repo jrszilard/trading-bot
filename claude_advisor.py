@@ -492,3 +492,198 @@ Provide a brief portfolio health report (terminal-friendly format)."""
         # This would typically fetch real market data/news
         # For now, return a placeholder
         return f"Market context for {', '.join(symbols[:5])} - Use external data integration for real context"
+
+    async def parse_intent(
+        self,
+        user_message: str,
+        conversation_history: Optional[List[Dict[str, str]]] = None,
+        context_summary: Optional[Dict[str, Any]] = None
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Parse user intent from natural language using Claude.
+
+        Uses Claude for NLU to extract:
+        - Intent type
+        - Confidence level
+        - Entities (symbols, trade IDs, strategies)
+
+        Args:
+            user_message: The user's natural language input
+            conversation_history: Recent conversation turns for context
+            context_summary: Current context state (active symbols, pending actions)
+
+        Returns:
+            Dict with parsed intent information, or None if parsing fails
+        """
+        if not self.is_available:
+            return None
+
+        system_prompt = """You are an intent parser for a trading bot that follows tastylive methodology.
+
+Your job is to analyze user messages and extract their intent for trading operations.
+
+INTENT TYPES (use exactly these values):
+- scan_opportunities: User wants to find new trading opportunities
+- show_pending: User wants to see pending trades awaiting approval
+- approve_trade: User wants to approve a specific trade
+- reject_trade: User wants to reject a specific trade
+- execute_trade: User wants to execute an approved trade
+- get_portfolio: User wants portfolio overview/delta/theta
+- get_positions: User wants to see current positions
+- get_buying_power: User wants buying power info
+- get_pnl: User wants P&L information
+- manage_positions: User wants to check positions for management
+- position_analysis: User asks about a specific position
+- get_iv_rank: User wants IV rank for a symbol
+- research_trade: User wants to research a trade/strategy
+- market_analysis: User wants market overview
+- get_risk_params: User wants to see risk parameters
+- confirm_yes: User is confirming/approving something
+- confirm_no: User is declining/rejecting something
+- help: User needs help
+- general_chat: General trading discussion/questions
+
+STRATEGIES (normalize to these values):
+- short_put, short_call, short_put_spread, short_call_spread
+- iron_condor, short_strangle, short_straddle
+- covered_call, cash_secured_put
+
+Output ONLY valid JSON with this structure:
+{
+  "intent": "<intent_type>",
+  "confidence": 0.0-1.0,
+  "symbols": ["SYM1", "SYM2"],
+  "trade_id": "abc123" or null,
+  "strategy": "strategy_type" or null,
+  "action": "approve/reject/execute" or null,
+  "reasoning": "brief explanation"
+}"""
+
+        # Build context for the LLM
+        context_parts = []
+
+        if conversation_history:
+            context_parts.append("Recent conversation:")
+            for turn in conversation_history[-5:]:
+                role = turn.get('role', 'user')
+                content = turn.get('content', '')
+                context_parts.append(f"  {role}: {content}")
+
+        if context_summary:
+            context_parts.append(f"\nCurrent context:")
+            if context_summary.get('current_symbol'):
+                context_parts.append(f"  Active symbol: {context_summary['current_symbol']}")
+            if context_summary.get('active_trade_id'):
+                context_parts.append(f"  Active trade ID: {context_summary['active_trade_id']}")
+            if context_summary.get('pending_action'):
+                context_parts.append(f"  Pending action: {context_summary['pending_action']}")
+            if context_summary.get('state'):
+                context_parts.append(f"  Conversation state: {context_summary['state']}")
+
+        user_prompt = f"""Parse the following user message:
+
+"{user_message}"
+
+{chr(10).join(context_parts) if context_parts else "No additional context."}
+
+Extract the intent and any entities. Output ONLY the JSON."""
+
+        response = self._call_claude(system_prompt, user_prompt)
+        parsed = self._parse_json_response(response)
+
+        if not parsed:
+            return None
+
+        # Normalize and validate
+        try:
+            return {
+                "intent": parsed.get("intent", "general_chat"),
+                "confidence": float(parsed.get("confidence", 0.5)),
+                "symbols": parsed.get("symbols", []),
+                "trade_id": parsed.get("trade_id"),
+                "strategy": parsed.get("strategy"),
+                "action": parsed.get("action"),
+                "reasoning": parsed.get("reasoning", "")
+            }
+        except (ValueError, TypeError) as e:
+            logger.error(f"Error normalizing parsed intent: {e}")
+            return None
+
+    async def generate_conversational_response(
+        self,
+        user_message: str,
+        intent: str,
+        context_data: Dict[str, Any],
+        conversation_history: Optional[List[Dict[str, str]]] = None
+    ) -> str:
+        """
+        Generate a natural conversational response for the chatbot.
+
+        Args:
+            user_message: The user's message
+            intent: The classified intent
+            context_data: Data relevant to the response (portfolio, positions, etc.)
+            conversation_history: Recent conversation for context
+
+        Returns:
+            Natural language response
+        """
+        if not self.is_available:
+            return self._generate_fallback_response(intent, context_data)
+
+        system_prompt = """You are a helpful trading assistant following the tastylive methodology.
+
+Your personality:
+- Knowledgeable about options trading, especially tastylive strategies
+- Concise but informative (this is a CLI chat interface)
+- You use tastylive best practices: sell premium, 45 DTE, 30 delta, manage at 21 DTE
+- You focus on probability and defined risk
+- You're careful about risk and always emphasize the approval workflow
+
+Response guidelines:
+- Keep responses brief (2-4 sentences usually)
+- Use bullet points for lists of data
+- Include relevant numbers/metrics when available
+- If discussing trades, mention key tastylive criteria (IV rank, delta, DTE)
+- Never recommend specific trades without proper analysis
+- Always remind about the approval process for actual trades
+
+Format for terminal display (no markdown headers, simple formatting)."""
+
+        # Build the prompt
+        history_text = ""
+        if conversation_history:
+            history_text = "\n".join([
+                f"{t['role']}: {t['content']}"
+                for t in conversation_history[-5:]
+            ])
+
+        user_prompt = f"""Generate a response for this interaction:
+
+User said: "{user_message}"
+Detected intent: {intent}
+
+Relevant data:
+{json.dumps(context_data, indent=2, default=str)}
+
+{f"Recent conversation:{chr(10)}{history_text}" if history_text else ""}
+
+Respond naturally and helpfully."""
+
+        response = self._call_claude(system_prompt, user_prompt)
+        return response or self._generate_fallback_response(intent, context_data)
+
+    def _generate_fallback_response(self, intent: str, context_data: Dict[str, Any]) -> str:
+        """Generate a basic response when Claude is unavailable"""
+        if intent == "get_portfolio":
+            return f"Portfolio: NLV ${context_data.get('net_liquidating_value', 'N/A')}, " \
+                   f"Delta {context_data.get('portfolio_delta', 'N/A')}"
+        elif intent == "show_pending":
+            pending = context_data.get('pending_trades', [])
+            if not pending:
+                return "No pending trades."
+            return f"{len(pending)} pending trade(s)."
+        elif intent == "help":
+            return "Available commands: scan, pending, approve, reject, execute, portfolio, positions, manage, research"
+        else:
+            return "Response generated (Claude unavailable for enhanced response)."

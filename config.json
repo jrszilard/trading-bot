@@ -306,6 +306,15 @@
       }
     },
 
+    "brave_search": {
+      "_comment": "Brave Search API for dynamic real-time market data",
+      "enabled": true,
+      "api_key": null,
+      "_api_key_note": "Set BRAVE_API_KEY env var or provide key here. Get one at https://brave.com/search/api/",
+      "cache_ttl_seconds": 300,
+      "refresh_on_scan": true
+    },
+
     "greeks_model": {
       "risk_free_rate": 0.05,
       "default_iv": 0.25
@@ -337,6 +346,39 @@
       "_comment": "What to do if Claude is unavailable",
       "use_rule_based_fallback": true,
       "log_fallback_usage": true
+    }
+  },
+
+  "chatbot": {
+    "_comment": "Natural language chatbot interface settings",
+
+    "enabled": true,
+
+    "conversation": {
+      "_comment": "Conversation management settings",
+      "max_history_turns": 20,
+      "context_window_turns": 10
+    },
+
+    "intent_parsing": {
+      "_comment": "Intent classification settings",
+      "use_claude_for_ambiguous": true,
+      "min_pattern_confidence": 0.7,
+      "fallback_to_general_chat": true
+    },
+
+    "response_style": {
+      "_comment": "Response formatting preferences",
+      "use_streaming": true,
+      "verbose_mode": false,
+      "include_tastylive_tips": true
+    },
+
+    "safety": {
+      "_comment": "Safety settings for the chatbot",
+      "require_explicit_approval": true,
+      "confirm_before_execute": true,
+      "warn_on_large_positions": true
     }
   }
 }

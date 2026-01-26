@@ -158,27 +158,101 @@ class TradeProposal:
     claude_confidence: Optional[int] = None
 
 
-@dataclass 
+@dataclass
 class PortfolioState:
     """Current portfolio state for risk calculations"""
     account_value: Decimal = Decimal("0")
     buying_power: Decimal = Decimal("0")
     net_liquidating_value: Decimal = Decimal("0")
     cash_balance: Decimal = Decimal("0")
-    
+
     # Current P&L
     daily_pnl: Decimal = Decimal("0")
     weekly_pnl: Decimal = Decimal("0")
-    
+
     # Beta-weighted portfolio Greeks (to SPY)
     portfolio_delta: Decimal = Decimal("0")
     portfolio_theta: Decimal = Decimal("0")
     portfolio_vega: Decimal = Decimal("0")
     portfolio_gamma: Decimal = Decimal("0")
-    
+
     # Position counts
     open_positions: int = 0
     positions_by_underlying: dict = field(default_factory=dict)
+
+
+@dataclass
+class TradeCandidate:
+    """
+    A candidate trade for multi-strategy evaluation.
+    Used internally during scanning to compare different strategies.
+    """
+    strategy: StrategyType
+    underlying: str
+    legs: List[dict]
+    net_credit: Decimal
+    max_loss: Decimal
+    probability_of_profit: Decimal
+    iv_rank: Decimal
+    dte: int
+    greeks: dict
+    score: Decimal = Decimal("0")  # Kelly-inspired score
+
+    # Strategy-specific details
+    short_strike: Optional[Decimal] = None
+    long_strike: Optional[Decimal] = None
+    spread_width: Optional[Decimal] = None
+    # For iron condors
+    put_short_strike: Optional[Decimal] = None
+    put_long_strike: Optional[Decimal] = None
+    call_short_strike: Optional[Decimal] = None
+    call_long_strike: Optional[Decimal] = None
+
+    def calculate_kelly_score(self) -> Decimal:
+        """
+        Calculate Kelly Criterion inspired score.
+
+        Kelly formula: f* = p - q/b
+        Where:
+        - p = probability of profit
+        - q = probability of loss (1 - p)
+        - b = reward/risk ratio (total_credit/max_loss)
+
+        Note: net_credit is per-share, max_loss is total dollars.
+        We multiply credit by 100 (contract multiplier) for comparison.
+
+        Higher score = better risk-adjusted opportunity
+        """
+        if self.max_loss <= 0 or self.net_credit <= 0:
+            return Decimal("-999")
+
+        p = self.probability_of_profit
+        q = Decimal("1") - p
+
+        # Convert per-share credit to total dollars (1 contract = 100 shares)
+        total_credit = self.net_credit * 100
+        b = total_credit / self.max_loss  # Reward/risk ratio
+
+        # Kelly score: p - (q / b)
+        # Avoid division by zero
+        if b <= 0:
+            return Decimal("-999")
+
+        self.score = p - (q / b)
+        return self.score
+
+    def return_on_risk(self) -> Decimal:
+        """Calculate return on risk percentage (total credit / max loss)."""
+        if self.max_loss <= 0:
+            return Decimal("0")
+        # Convert per-share credit to total dollars
+        total_credit = self.net_credit * 100
+        return (total_credit / self.max_loss) * 100
+
+    def expected_value(self) -> Decimal:
+        """Calculate expected value of the trade."""
+        p = self.probability_of_profit
+        return (p * self.net_credit) - ((1 - p) * self.max_loss)
 
 
 class TastytradeBot:
@@ -553,6 +627,520 @@ class TastytradeBot:
         except Exception as e:
             logger.error(f"Beta-weighted Greeks calculation failed: {e}")
 
+    # =========================================================================
+    # MULTI-STRATEGY EVALUATION SYSTEM
+    # =========================================================================
+
+    def _build_put_spread_candidate(
+        self,
+        symbol: str,
+        puts: List,
+        greeks_by_strike: dict,
+        quotes_by_strike: dict,
+        iv_rank: Decimal,
+        target_exp: date,
+        target_delta: Decimal = Decimal("-0.30")
+    ) -> Optional[TradeCandidate]:
+        """
+        Build a put credit spread candidate for evaluation.
+
+        Args:
+            symbol: Underlying symbol
+            puts: List of put options sorted by strike descending
+            greeks_by_strike: Map of strike -> greeks
+            quotes_by_strike: Map of strike -> (bid, ask) tuple
+            iv_rank: Current IV rank
+            target_exp: Target expiration date
+            target_delta: Target delta for short put (default -0.30)
+
+        Returns:
+            TradeCandidate if valid spread found, None otherwise
+        """
+        # Find the short put at target delta
+        short_put = None
+        short_greeks = None
+        best_delta_diff = Decimal("1.0")
+
+        for opt in puts:
+            strike = opt.strike_price if hasattr(opt, 'strike_price') else Decimal(str(opt.get('strike_price', 0)))
+            if strike not in greeks_by_strike:
+                continue
+            g = greeks_by_strike[strike]
+            delta = Decimal(str(g.delta if hasattr(g, 'delta') else g.get('delta', 0)))
+            delta_diff = abs(delta - target_delta)
+
+            if delta_diff < best_delta_diff:
+                best_delta_diff = delta_diff
+                short_put = opt
+                short_greeks = g
+
+        if short_put is None:
+            return None
+
+        short_strike = short_put.strike_price if hasattr(short_put, 'strike_price') else Decimal(str(short_put.get('strike_price', 0)))
+
+        if short_strike not in quotes_by_strike:
+            return None
+
+        short_bid, short_ask = quotes_by_strike[short_strike]
+        short_credit = (short_bid + short_ask) / 2
+
+        if short_credit <= 0:
+            return None
+
+        # Calculate optimal spread width
+        estimated_net_credit = short_credit * Decimal("0.40")
+        max_width = (self.risk_params.max_position_loss + estimated_net_credit * 100) / 100
+
+        # Get strike interval
+        sorted_strikes = sorted(greeks_by_strike.keys(), reverse=True)
+        if len(sorted_strikes) >= 2:
+            strike_interval = abs(sorted_strikes[0] - sorted_strikes[1])
+        else:
+            strike_interval = Decimal("1.0")
+
+        # Find optimal long put
+        available_strikes = [s for s in sorted_strikes if s < short_strike]
+        if not available_strikes:
+            return None
+
+        long_strike = None
+        long_greeks = None
+        net_credit = Decimal("0")
+        max_loss = Decimal("0")
+        spread_width = Decimal("0")
+
+        for strike in sorted(available_strikes, reverse=True):
+            if strike not in quotes_by_strike:
+                continue
+
+            long_bid, long_ask = quotes_by_strike[strike]
+            long_debit = (long_bid + long_ask) / 2
+
+            width = short_strike - strike
+            test_net_credit = short_credit - long_debit
+            test_max_loss = (width * 100) - (test_net_credit * 100)
+
+            if test_max_loss <= self.risk_params.max_position_loss and test_net_credit > Decimal("0.10"):
+                long_strike = strike
+                long_greeks = greeks_by_strike[strike]
+                spread_width = width
+                net_credit = test_net_credit
+                max_loss = test_max_loss
+                break
+
+        if long_strike is None:
+            return None
+
+        dte = (target_exp - date.today()).days
+        short_delta = Decimal(str(short_greeks.delta if hasattr(short_greeks, 'delta') else short_greeks.get('delta', 0)))
+        prob_otm = Decimal("1") + short_delta
+
+        # Build legs
+        legs = self._create_spread_legs(
+            short_put, long_strike, short_credit, net_credit,
+            target_exp, dte, 'PUT', greeks_by_strike, quotes_by_strike
+        )
+
+        # Net greeks
+        long_delta = Decimal(str(long_greeks.delta if hasattr(long_greeks, 'delta') else long_greeks.get('delta', 0)))
+        long_theta = Decimal(str(long_greeks.theta if hasattr(long_greeks, 'theta') else long_greeks.get('theta', 0)))
+        long_vega = Decimal(str(long_greeks.vega if hasattr(long_greeks, 'vega') else long_greeks.get('vega', 0)))
+        long_gamma = Decimal(str(long_greeks.gamma if hasattr(long_greeks, 'gamma') else long_greeks.get('gamma', 0)))
+        short_theta = Decimal(str(short_greeks.theta if hasattr(short_greeks, 'theta') else short_greeks.get('theta', 0)))
+        short_vega = Decimal(str(short_greeks.vega if hasattr(short_greeks, 'vega') else short_greeks.get('vega', 0)))
+        short_gamma = Decimal(str(short_greeks.gamma if hasattr(short_greeks, 'gamma') else short_greeks.get('gamma', 0)))
+
+        greeks = {
+            'delta': float(short_delta + long_delta),
+            'theta': float(short_theta + long_theta),
+            'vega': float(short_vega + long_vega),
+            'gamma': float(short_gamma + long_gamma),
+            'pop': float(prob_otm)
+        }
+
+        candidate = TradeCandidate(
+            strategy=StrategyType.SHORT_PUT_SPREAD,
+            underlying=symbol,
+            legs=legs,
+            net_credit=net_credit,
+            max_loss=max_loss,
+            probability_of_profit=prob_otm,
+            iv_rank=iv_rank,
+            dte=dte,
+            greeks=greeks,
+            short_strike=short_strike,
+            long_strike=long_strike,
+            spread_width=spread_width
+        )
+        candidate.calculate_kelly_score()
+
+        return candidate
+
+    def _build_call_spread_candidate(
+        self,
+        symbol: str,
+        calls: List,
+        greeks_by_strike: dict,
+        quotes_by_strike: dict,
+        iv_rank: Decimal,
+        target_exp: date,
+        target_delta: Decimal = Decimal("0.30")
+    ) -> Optional[TradeCandidate]:
+        """
+        Build a call credit spread candidate for evaluation.
+
+        Args:
+            symbol: Underlying symbol
+            calls: List of call options sorted by strike ascending
+            greeks_by_strike: Map of strike -> greeks
+            quotes_by_strike: Map of strike -> (bid, ask) tuple
+            iv_rank: Current IV rank
+            target_exp: Target expiration date
+            target_delta: Target delta for short call (default 0.30)
+
+        Returns:
+            TradeCandidate if valid spread found, None otherwise
+        """
+        # Find the short call at target delta
+        short_call = None
+        short_greeks = None
+        best_delta_diff = Decimal("1.0")
+
+        for opt in calls:
+            strike = opt.strike_price if hasattr(opt, 'strike_price') else Decimal(str(opt.get('strike_price', 0)))
+            if strike not in greeks_by_strike:
+                continue
+            g = greeks_by_strike[strike]
+            delta = Decimal(str(g.delta if hasattr(g, 'delta') else g.get('delta', 0)))
+            delta_diff = abs(delta - target_delta)
+
+            if delta_diff < best_delta_diff:
+                best_delta_diff = delta_diff
+                short_call = opt
+                short_greeks = g
+
+        if short_call is None:
+            return None
+
+        short_strike = short_call.strike_price if hasattr(short_call, 'strike_price') else Decimal(str(short_call.get('strike_price', 0)))
+
+        if short_strike not in quotes_by_strike:
+            return None
+
+        short_bid, short_ask = quotes_by_strike[short_strike]
+        short_credit = (short_bid + short_ask) / 2
+
+        if short_credit <= 0:
+            return None
+
+        # Calculate optimal spread width
+        estimated_net_credit = short_credit * Decimal("0.40")
+        max_width = (self.risk_params.max_position_loss + estimated_net_credit * 100) / 100
+
+        # Get strike interval
+        sorted_strikes = sorted(greeks_by_strike.keys())
+        if len(sorted_strikes) >= 2:
+            strike_interval = abs(sorted_strikes[1] - sorted_strikes[0])
+        else:
+            strike_interval = Decimal("1.0")
+
+        # Find optimal long call (higher strike for call spread)
+        available_strikes = [s for s in sorted_strikes if s > short_strike]
+        if not available_strikes:
+            return None
+
+        long_strike = None
+        long_greeks = None
+        net_credit = Decimal("0")
+        max_loss = Decimal("0")
+        spread_width = Decimal("0")
+
+        for strike in sorted(available_strikes):  # Ascending for calls
+            if strike not in quotes_by_strike:
+                continue
+
+            long_bid, long_ask = quotes_by_strike[strike]
+            long_debit = (long_bid + long_ask) / 2
+
+            width = strike - short_strike
+            test_net_credit = short_credit - long_debit
+            test_max_loss = (width * 100) - (test_net_credit * 100)
+
+            if test_max_loss <= self.risk_params.max_position_loss and test_net_credit > Decimal("0.10"):
+                long_strike = strike
+                long_greeks = greeks_by_strike[strike]
+                spread_width = width
+                net_credit = test_net_credit
+                max_loss = test_max_loss
+                break
+
+        if long_strike is None:
+            return None
+
+        dte = (target_exp - date.today()).days
+        short_delta = Decimal(str(short_greeks.delta if hasattr(short_greeks, 'delta') else short_greeks.get('delta', 0)))
+        # For calls, prob OTM = 1 - delta
+        prob_otm = Decimal("1") - short_delta
+
+        # Build legs
+        legs = self._create_spread_legs(
+            short_call, long_strike, short_credit, net_credit,
+            target_exp, dte, 'CALL', greeks_by_strike, quotes_by_strike
+        )
+
+        # Net greeks
+        long_delta = Decimal(str(long_greeks.delta if hasattr(long_greeks, 'delta') else long_greeks.get('delta', 0)))
+        long_theta = Decimal(str(long_greeks.theta if hasattr(long_greeks, 'theta') else long_greeks.get('theta', 0)))
+        long_vega = Decimal(str(long_greeks.vega if hasattr(long_greeks, 'vega') else long_greeks.get('vega', 0)))
+        long_gamma = Decimal(str(long_greeks.gamma if hasattr(long_greeks, 'gamma') else long_greeks.get('gamma', 0)))
+        short_theta = Decimal(str(short_greeks.theta if hasattr(short_greeks, 'theta') else short_greeks.get('theta', 0)))
+        short_vega = Decimal(str(short_greeks.vega if hasattr(short_greeks, 'vega') else short_greeks.get('vega', 0)))
+        short_gamma = Decimal(str(short_greeks.gamma if hasattr(short_greeks, 'gamma') else short_greeks.get('gamma', 0)))
+
+        greeks = {
+            'delta': float(short_delta + long_delta),
+            'theta': float(short_theta + long_theta),
+            'vega': float(short_vega + long_vega),
+            'gamma': float(short_gamma + long_gamma),
+            'pop': float(prob_otm)
+        }
+
+        candidate = TradeCandidate(
+            strategy=StrategyType.SHORT_CALL_SPREAD,
+            underlying=symbol,
+            legs=legs,
+            net_credit=net_credit,
+            max_loss=max_loss,
+            probability_of_profit=prob_otm,
+            iv_rank=iv_rank,
+            dte=dte,
+            greeks=greeks,
+            short_strike=short_strike,
+            long_strike=long_strike,
+            spread_width=spread_width
+        )
+        candidate.calculate_kelly_score()
+
+        return candidate
+
+    def _build_iron_condor_candidate(
+        self,
+        symbol: str,
+        puts: List,
+        calls: List,
+        put_greeks: dict,
+        call_greeks: dict,
+        put_quotes: dict,
+        call_quotes: dict,
+        iv_rank: Decimal,
+        target_exp: date,
+        put_delta: Decimal = Decimal("-0.16"),
+        call_delta: Decimal = Decimal("0.16")
+    ) -> Optional[TradeCandidate]:
+        """
+        Build an iron condor candidate for evaluation.
+
+        Iron condor = put spread + call spread (neutral strategy)
+        Uses 16 delta for wider wings (tastylive standard for IC)
+
+        Returns:
+            TradeCandidate if valid iron condor found, None otherwise
+        """
+        # Build put spread side
+        put_candidate = self._build_put_spread_candidate(
+            symbol, puts, put_greeks, put_quotes, iv_rank, target_exp,
+            target_delta=put_delta
+        )
+
+        # Build call spread side
+        call_candidate = self._build_call_spread_candidate(
+            symbol, calls, call_greeks, call_quotes, iv_rank, target_exp,
+            target_delta=call_delta
+        )
+
+        if put_candidate is None or call_candidate is None:
+            return None
+
+        # Combine into iron condor
+        # Check combined max loss fits within limit
+        # For iron condor, max loss is the wider spread width (since you can only lose on one side)
+        combined_max_loss = max(put_candidate.max_loss, call_candidate.max_loss)
+        combined_credit = put_candidate.net_credit + call_candidate.net_credit
+
+        if combined_max_loss > self.risk_params.max_position_loss:
+            return None
+
+        # Combined probability: product of both sides being OTM
+        combined_prob = put_candidate.probability_of_profit * call_candidate.probability_of_profit
+
+        dte = put_candidate.dte
+
+        # Combine legs
+        legs = put_candidate.legs + call_candidate.legs
+
+        # Combined greeks (mostly cancel out for neutral strategy)
+        greeks = {
+            'delta': put_candidate.greeks['delta'] + call_candidate.greeks['delta'],
+            'theta': put_candidate.greeks['theta'] + call_candidate.greeks['theta'],
+            'vega': put_candidate.greeks['vega'] + call_candidate.greeks['vega'],
+            'gamma': put_candidate.greeks['gamma'] + call_candidate.greeks['gamma'],
+            'pop': float(combined_prob)
+        }
+
+        candidate = TradeCandidate(
+            strategy=StrategyType.IRON_CONDOR,
+            underlying=symbol,
+            legs=legs,
+            net_credit=combined_credit,
+            max_loss=combined_max_loss,
+            probability_of_profit=combined_prob,
+            iv_rank=iv_rank,
+            dte=dte,
+            greeks=greeks,
+            put_short_strike=put_candidate.short_strike,
+            put_long_strike=put_candidate.long_strike,
+            call_short_strike=call_candidate.short_strike,
+            call_long_strike=call_candidate.long_strike
+        )
+        candidate.calculate_kelly_score()
+
+        return candidate
+
+    def _create_spread_legs(
+        self,
+        short_option,
+        long_strike: Decimal,
+        short_credit: Decimal,
+        net_credit: Decimal,
+        target_exp: date,
+        dte: int,
+        option_type: str,
+        greeks_by_strike: dict,
+        quotes_by_strike: dict
+    ) -> List[dict]:
+        """Helper to create legs for a vertical spread."""
+        short_strike = short_option.strike_price if hasattr(short_option, 'strike_price') else Decimal(str(short_option.get('strike_price', 0)))
+
+        # Get option symbols
+        short_symbol = short_option.symbol if hasattr(short_option, 'symbol') else short_option.get('symbol', '')
+        short_streamer = short_option.streamer_symbol if hasattr(short_option, 'streamer_symbol') else short_option.get('streamer_symbol', '')
+
+        # Calculate long debit
+        long_debit = short_credit - net_credit
+
+        legs = [
+            {
+                'symbol': short_symbol,
+                'streamer_symbol': short_streamer,
+                'option_type': option_type,
+                'strike': str(short_strike),
+                'expiration': str(target_exp),
+                'action': 'SELL_TO_OPEN',
+                'quantity': 1,
+                'credit': str(short_credit),
+                'dte': dte
+            },
+            {
+                'option_type': option_type,
+                'strike': str(long_strike),
+                'expiration': str(target_exp),
+                'action': 'BUY_TO_OPEN',
+                'quantity': 1,
+                'debit': str(long_debit),
+                'dte': dte
+            }
+        ]
+
+        return legs
+
+    def _evaluate_strategies_for_symbol(
+        self,
+        symbol: str,
+        options: List,
+        greeks_by_strike: dict,
+        quotes_by_strike: dict,
+        iv_rank: Decimal,
+        target_exp: date,
+        max_candidates: int = 3
+    ) -> List[TradeCandidate]:
+        """
+        Evaluate all defined-risk strategies for a symbol and return top candidates.
+
+        Args:
+            symbol: Underlying symbol
+            options: All options for the symbol at target expiration
+            greeks_by_strike: Combined greeks map (puts and calls)
+            quotes_by_strike: Combined quotes map (puts and calls)
+            iv_rank: Current IV rank
+            target_exp: Target expiration
+            max_candidates: Maximum candidates to return (default 3)
+
+        Returns:
+            List of top TradeCandidate objects sorted by Kelly score
+        """
+        candidates = []
+
+        # Separate puts and calls
+        puts = sorted(
+            [opt for opt in options if (opt.option_type if hasattr(opt, 'option_type') else opt.get('option_type')) == 'P'],
+            key=lambda x: x.strike_price if hasattr(x, 'strike_price') else Decimal(str(x.get('strike_price', 0))),
+            reverse=True
+        )
+        calls = sorted(
+            [opt for opt in options if (opt.option_type if hasattr(opt, 'option_type') else opt.get('option_type')) == 'C'],
+            key=lambda x: x.strike_price if hasattr(x, 'strike_price') else Decimal(str(x.get('strike_price', 0)))
+        )
+
+        # Separate greeks and quotes by type
+        put_strikes = {opt.strike_price if hasattr(opt, 'strike_price') else Decimal(str(opt.get('strike_price', 0))) for opt in puts}
+        call_strikes = {opt.strike_price if hasattr(opt, 'strike_price') else Decimal(str(opt.get('strike_price', 0))) for opt in calls}
+
+        put_greeks = {k: v for k, v in greeks_by_strike.items() if k in put_strikes}
+        call_greeks = {k: v for k, v in greeks_by_strike.items() if k in call_strikes}
+        put_quotes = {k: v for k, v in quotes_by_strike.items() if k in put_strikes}
+        call_quotes = {k: v for k, v in quotes_by_strike.items() if k in call_strikes}
+
+        # Strategy 1: Put Credit Spread (30 delta - bullish)
+        put_spread = self._build_put_spread_candidate(
+            symbol, puts, put_greeks, put_quotes, iv_rank, target_exp,
+            target_delta=Decimal("-0.30")
+        )
+        if put_spread:
+            candidates.append(put_spread)
+            logger.debug(f"{symbol} PUT SPREAD: {put_spread.short_strike}P/{put_spread.long_strike}P "
+                        f"Score={put_spread.score:.3f}, Credit=${put_spread.net_credit:.2f}")
+
+        # Strategy 2: Call Credit Spread (30 delta - bearish)
+        call_spread = self._build_call_spread_candidate(
+            symbol, calls, call_greeks, call_quotes, iv_rank, target_exp,
+            target_delta=Decimal("0.30")
+        )
+        if call_spread:
+            candidates.append(call_spread)
+            logger.debug(f"{symbol} CALL SPREAD: {call_spread.short_strike}C/{call_spread.long_strike}C "
+                        f"Score={call_spread.score:.3f}, Credit=${call_spread.net_credit:.2f}")
+
+        # Strategy 3: Iron Condor (16 delta wings - neutral)
+        iron_condor = self._build_iron_condor_candidate(
+            symbol, puts, calls, put_greeks, call_greeks, put_quotes, call_quotes,
+            iv_rank, target_exp
+        )
+        if iron_condor:
+            candidates.append(iron_condor)
+            logger.debug(f"{symbol} IRON CONDOR: {iron_condor.put_short_strike}P/{iron_condor.put_long_strike}P "
+                        f"+ {iron_condor.call_short_strike}C/{iron_condor.call_long_strike}C "
+                        f"Score={iron_condor.score:.3f}, Credit=${iron_condor.net_credit:.2f}")
+
+        # Sort by Kelly score (descending) and return top N
+        candidates.sort(key=lambda x: x.score, reverse=True)
+
+        if candidates:
+            logger.info(f"{symbol}: Evaluated {len(candidates)} strategies, "
+                       f"best={candidates[0].strategy.value} (score={candidates[0].score:.3f})")
+
+        return candidates[:max_candidates]
+
     def check_risk_limits(self, proposal: TradeProposal) -> tuple[bool, str]:
         """
         Check if a proposed trade passes all risk limits
@@ -668,8 +1256,26 @@ class TastytradeBot:
         import uuid
 
         # Calculate expected credit and max loss from legs
-        expected_credit = sum(Decimal(str(leg.get('credit', 0))) for leg in legs)
-        max_loss = sum(Decimal(str(leg.get('max_loss', 0))) for leg in legs)
+        # For spreads: net credit = credits received - debits paid
+        total_credits = sum(Decimal(str(leg.get('credit', 0))) for leg in legs)
+        total_debits = sum(Decimal(str(leg.get('debit', 0))) for leg in legs)
+        expected_credit = total_credits - total_debits
+
+        # For spreads: max loss = spread width - net credit (calculated during scanning)
+        # Check if max_loss is explicitly provided in any leg
+        explicit_max_loss = sum(Decimal(str(leg.get('max_loss', 0))) for leg in legs)
+        if explicit_max_loss > 0:
+            max_loss = explicit_max_loss
+        elif strategy in (StrategyType.SHORT_PUT_SPREAD, StrategyType.SHORT_CALL_SPREAD):
+            # Calculate max loss for vertical spreads: width * 100 - net_credit * 100
+            strikes = [Decimal(str(leg.get('strike', 0))) for leg in legs]
+            if len(strikes) >= 2:
+                spread_width = abs(max(strikes) - min(strikes))
+                max_loss = (spread_width * 100) - (expected_credit * 100)
+            else:
+                max_loss = Decimal("0")
+        else:
+            max_loss = Decimal("0")
 
         # Get DTE from first leg
         dte = legs[0].get('dte', self.risk_params.target_dte) if legs else self.risk_params.target_dte
@@ -911,7 +1517,444 @@ class TastytradeBot:
             proposal.status = TradeStatus.FAILED
             proposal.execution_result = {"error": str(e)}
             return False
-    
+
+    async def close_position(self, position_symbol: str) -> Dict[str, Any]:
+        """
+        Close an existing position by buying/selling to close.
+
+        Args:
+            position_symbol: The underlying symbol of the position to close
+
+        Returns:
+            Dict with 'success' boolean and 'message' or 'error' string
+        """
+        result = {'success': False, 'message': '', 'error': None}
+
+        # Use mock data if enabled
+        if self.use_mock_data:
+            logger.info(f"[MOCK] Closing position: {position_symbol}")
+            result['success'] = True
+            result['message'] = f"[SANDBOX] Position {position_symbol} closed successfully (mock)"
+            result['order_id'] = 'mock-close-' + position_symbol.lower()
+            return result
+
+        if not self.session:
+            result['error'] = "No active session"
+            return result
+
+        if not await self.ensure_session_valid():
+            result['error'] = "Session validation failed"
+            return result
+
+        try:
+            from tastytrade import Account
+            from tastytrade.order import NewOrder, OrderAction, OrderTimeInForce, OrderType, Leg
+            from tastytrade.instruments import Option
+            from tastytrade import DXLinkStreamer
+            from tastytrade.dxfeed import Quote
+
+            account = Account.get(self.session)[0]
+            positions = account.get_positions(self.session)
+
+            # Find positions matching the symbol
+            matching_positions = [
+                p for p in positions
+                if p.underlying_symbol.upper() == position_symbol.upper()
+                and p.instrument_type == 'Equity Option'
+            ]
+
+            if not matching_positions:
+                result['error'] = f"No open option positions found for {position_symbol}"
+                return result
+
+            # Build close order legs
+            order_legs = []
+            for pos in matching_positions:
+                try:
+                    option = Option.get_option(self.session, pos.symbol)
+
+                    # Determine close action based on position direction
+                    if pos.quantity > 0:
+                        # Long position - sell to close
+                        action = OrderAction.SELL_TO_CLOSE
+                    else:
+                        # Short position - buy to close
+                        action = OrderAction.BUY_TO_CLOSE
+
+                    leg = Leg(
+                        instrument_type=option.instrument_type,
+                        symbol=option.symbol,
+                        action=action,
+                        quantity=abs(pos.quantity)
+                    )
+                    order_legs.append(leg)
+                except Exception as e:
+                    logger.warning(f"Could not build leg for {pos.symbol}: {e}")
+
+            if not order_legs:
+                result['error'] = "Could not build order legs for position"
+                return result
+
+            # Get current mid price for limit order
+            streamer_symbols = [Option.get_option(self.session, pos.symbol).streamer_symbol
+                               for pos in matching_positions]
+
+            total_price = Decimal("0")
+            async with DXLinkStreamer(self.session) as streamer:
+                await streamer.subscribe(Quote, streamer_symbols)
+                quotes = {}
+                timeout_count = 0
+                while len(quotes) < len(streamer_symbols) and timeout_count < 20:
+                    try:
+                        quote = await asyncio.wait_for(
+                            streamer.get_event(Quote), timeout=0.5
+                        )
+                        quotes[quote.event_symbol] = quote
+                    except asyncio.TimeoutError:
+                        timeout_count += 1
+
+                for sym, quote in quotes.items():
+                    mid = (Decimal(str(quote.bid_price or 0)) +
+                           Decimal(str(quote.ask_price or 0))) / 2
+                    total_price += mid
+
+            # Create close order (negative price for credit, positive for debit)
+            # For BTC orders, we're buying so it's a debit (positive price)
+            order = NewOrder(
+                time_in_force=OrderTimeInForce.DAY,
+                order_type=OrderType.LIMIT,
+                legs=order_legs,
+                price=total_price  # Positive = debit for BTC
+            )
+
+            # Dry run first
+            dry_run_result = account.place_order(self.session, order, dry_run=True)
+            logger.info(f"Close order dry run: {dry_run_result}")
+
+            if self.sandbox_mode:
+                result['success'] = True
+                result['message'] = f"[SANDBOX] Close order submitted for {position_symbol}"
+                result['dry_run'] = str(dry_run_result)
+            else:
+                order_result = account.place_order(self.session, order, dry_run=False)
+                result['success'] = True
+                result['message'] = f"Close order executed for {position_symbol}"
+                result['order_id'] = str(order_result.order.id) if order_result.order else None
+
+            logger.info(f"Position {position_symbol} close: {result['message']}")
+
+        except Exception as e:
+            logger.error(f"Close position failed: {e}")
+            result['error'] = str(e)
+
+        return result
+
+    async def roll_position(
+        self,
+        position_symbol: str,
+        target_dte: int = 45
+    ) -> Dict[str, Any]:
+        """
+        Roll an existing position to a new expiration.
+
+        Closes the current position and opens a new one at the same strike
+        but with a later expiration (typically next monthly).
+
+        Args:
+            position_symbol: The underlying symbol of the position to roll
+            target_dte: Target DTE for the new position (default 45)
+
+        Returns:
+            Dict with 'success' boolean, 'message', 'net_credit' and/or 'error'
+        """
+        result = {'success': False, 'message': '', 'error': None, 'net_credit': 0}
+
+        # Use mock data if enabled
+        if self.use_mock_data:
+            logger.info(f"[MOCK] Rolling position: {position_symbol} to ~{target_dte} DTE")
+            result['success'] = True
+            result['message'] = f"[SANDBOX] Position {position_symbol} rolled to ~{target_dte} DTE (mock)"
+            result['net_credit'] = 0.35  # Mock credit
+            result['order_id'] = 'mock-roll-' + position_symbol.lower()
+            return result
+
+        if not self.session:
+            result['error'] = "No active session"
+            return result
+
+        if not await self.ensure_session_valid():
+            result['error'] = "Session validation failed"
+            return result
+
+        try:
+            from tastytrade import Account
+            from tastytrade.order import NewOrder, OrderAction, OrderTimeInForce, OrderType, Leg
+            from tastytrade.instruments import Option, get_option_chain
+            from tastytrade.utils import get_tasty_monthly
+            from tastytrade import DXLinkStreamer
+            from tastytrade.dxfeed import Quote
+
+            account = Account.get(self.session)[0]
+            positions = account.get_positions(self.session)
+
+            # Find positions matching the symbol
+            matching_positions = [
+                p for p in positions
+                if p.underlying_symbol.upper() == position_symbol.upper()
+                and p.instrument_type == 'Equity Option'
+            ]
+
+            if not matching_positions:
+                result['error'] = f"No open option positions found for {position_symbol}"
+                return result
+
+            # Get target expiration (next monthly)
+            target_exp = get_tasty_monthly()
+
+            # Get option chain for new positions
+            chain = get_option_chain(self.session, position_symbol)
+            if target_exp not in chain:
+                result['error'] = f"No options available at target expiration for {position_symbol}"
+                return result
+
+            new_options = chain[target_exp]
+
+            order_legs = []
+            total_close_price = Decimal("0")
+            total_open_price = Decimal("0")
+
+            for pos in matching_positions:
+                try:
+                    old_option = Option.get_option(self.session, pos.symbol)
+
+                    # Find matching strike in new expiration
+                    new_option = None
+                    for opt in new_options:
+                        if (opt.strike_price == old_option.strike_price and
+                            opt.option_type == old_option.option_type):
+                            new_option = opt
+                            break
+
+                    if new_option is None:
+                        logger.warning(f"Could not find matching strike for roll: {pos.symbol}")
+                        continue
+
+                    # Determine actions based on position direction
+                    if pos.quantity > 0:
+                        # Long position - sell to close, buy to open
+                        close_action = OrderAction.SELL_TO_CLOSE
+                        open_action = OrderAction.BUY_TO_OPEN
+                    else:
+                        # Short position - buy to close, sell to open
+                        close_action = OrderAction.BUY_TO_CLOSE
+                        open_action = OrderAction.SELL_TO_OPEN
+
+                    # Close leg
+                    close_leg = Leg(
+                        instrument_type=old_option.instrument_type,
+                        symbol=old_option.symbol,
+                        action=close_action,
+                        quantity=abs(pos.quantity)
+                    )
+                    order_legs.append(close_leg)
+
+                    # Open leg
+                    open_leg = Leg(
+                        instrument_type=new_option.instrument_type,
+                        symbol=new_option.symbol,
+                        action=open_action,
+                        quantity=abs(pos.quantity)
+                    )
+                    order_legs.append(open_leg)
+
+                except Exception as e:
+                    logger.warning(f"Could not build roll legs for {pos.symbol}: {e}")
+
+            if not order_legs:
+                result['error'] = "Could not build order legs for roll"
+                return result
+
+            # Get current prices for all options
+            old_symbols = [Option.get_option(self.session, pos.symbol).streamer_symbol
+                          for pos in matching_positions]
+            new_symbols = []
+            for pos in matching_positions:
+                old_opt = Option.get_option(self.session, pos.symbol)
+                for opt in new_options:
+                    if (opt.strike_price == old_opt.strike_price and
+                        opt.option_type == old_opt.option_type):
+                        new_symbols.append(opt.streamer_symbol)
+                        break
+
+            all_symbols = old_symbols + new_symbols
+
+            async with DXLinkStreamer(self.session) as streamer:
+                await streamer.subscribe(Quote, all_symbols)
+                quotes = {}
+                timeout_count = 0
+                while len(quotes) < len(all_symbols) and timeout_count < 30:
+                    try:
+                        quote = await asyncio.wait_for(
+                            streamer.get_event(Quote), timeout=0.5
+                        )
+                        quotes[quote.event_symbol] = quote
+                    except asyncio.TimeoutError:
+                        timeout_count += 1
+
+                # Calculate net credit
+                for sym in old_symbols:
+                    if sym in quotes:
+                        mid = (Decimal(str(quotes[sym].bid_price or 0)) +
+                               Decimal(str(quotes[sym].ask_price or 0))) / 2
+                        total_close_price += mid
+
+                for sym in new_symbols:
+                    if sym in quotes:
+                        mid = (Decimal(str(quotes[sym].bid_price or 0)) +
+                               Decimal(str(quotes[sym].ask_price or 0))) / 2
+                        total_open_price += mid
+
+            # For short positions rolling: close debit, open credit
+            # Net credit = open credit - close debit (for short positions)
+            net_credit = total_open_price - total_close_price
+
+            # Check minimum credit requirement
+            min_credit = Decimal(str(
+                self.config.get('management_rules', {})
+                .get('rolling_rules', {})
+                .get('min_credit_for_roll', 0.25)
+            ))
+
+            if net_credit < min_credit:
+                result['error'] = f"Net credit ${net_credit:.2f} below minimum ${min_credit:.2f}"
+                return result
+
+            # Create combo order
+            order = NewOrder(
+                time_in_force=OrderTimeInForce.DAY,
+                order_type=OrderType.LIMIT,
+                legs=order_legs,
+                price=-net_credit  # Negative for credit
+            )
+
+            # Dry run first
+            dry_run_result = account.place_order(self.session, order, dry_run=True)
+            logger.info(f"Roll order dry run: {dry_run_result}")
+
+            if self.sandbox_mode:
+                result['success'] = True
+                result['message'] = f"[SANDBOX] Roll order submitted for {position_symbol}"
+                result['net_credit'] = float(net_credit)
+                result['dry_run'] = str(dry_run_result)
+            else:
+                order_result = account.place_order(self.session, order, dry_run=False)
+                result['success'] = True
+                result['message'] = f"Roll order executed for {position_symbol}"
+                result['net_credit'] = float(net_credit)
+                result['order_id'] = str(order_result.order.id) if order_result.order else None
+
+            logger.info(f"Position {position_symbol} roll: {result['message']} (credit: ${net_credit:.2f})")
+
+        except Exception as e:
+            logger.error(f"Roll position failed: {e}")
+            result['error'] = str(e)
+
+        return result
+
+    async def get_position_details(self, position_symbol: str) -> Optional[Dict[str, Any]]:
+        """
+        Get details about a position for display/confirmation.
+
+        Args:
+            position_symbol: The underlying symbol
+
+        Returns:
+            Dict with position details or None if not found
+        """
+        # Use mock data if enabled
+        if self.use_mock_data:
+            # Return mock position data
+            return {
+                'symbol': position_symbol,
+                'underlying': position_symbol,
+                'positions': [
+                    {
+                        'option_symbol': f'{position_symbol}  250221P00450000',
+                        'option_type': 'PUT',
+                        'strike': 450.0,
+                        'expiration': '2025-02-21',
+                        'quantity': -1,
+                        'entry_price': 2.50,
+                        'current_price': 1.25,
+                        'pnl_percent': 0.50,
+                        'dte': 28
+                    }
+                ],
+                'total_pnl_percent': 0.50,
+                'total_dte': 28,
+                'is_tested': False
+            }
+
+        if not self.session:
+            return None
+
+        try:
+            from tastytrade import Account
+            from tastytrade.instruments import Option
+            from tastytrade import DXLinkStreamer
+            from tastytrade.dxfeed import Quote
+
+            account = Account.get(self.session)[0]
+            positions = account.get_positions(self.session)
+
+            matching = [
+                p for p in positions
+                if p.underlying_symbol.upper() == position_symbol.upper()
+                and p.instrument_type == 'Equity Option'
+            ]
+
+            if not matching:
+                return None
+
+            details = {
+                'symbol': position_symbol,
+                'underlying': position_symbol,
+                'positions': [],
+                'total_pnl_percent': 0,
+                'total_dte': 999,
+                'is_tested': False
+            }
+
+            for pos in matching:
+                try:
+                    opt = Option.get_option(self.session, pos.symbol)
+                    dte = (opt.expiration_date - date.today()).days
+
+                    pos_detail = {
+                        'option_symbol': pos.symbol,
+                        'option_type': opt.option_type,
+                        'strike': float(opt.strike_price),
+                        'expiration': str(opt.expiration_date),
+                        'quantity': pos.quantity,
+                        'entry_price': float(pos.average_open_price or 0),
+                        'current_price': 0,
+                        'pnl_percent': 0,
+                        'dte': dte
+                    }
+
+                    details['positions'].append(pos_detail)
+                    if dte < details['total_dte']:
+                        details['total_dte'] = dte
+
+                except Exception as e:
+                    logger.warning(f"Could not get details for {pos.symbol}: {e}")
+
+            return details
+
+        except Exception as e:
+            logger.error(f"Get position details failed: {e}")
+            return None
+
     async def scan_for_opportunities(self, symbols: List[str]) -> List[TradeProposal]:
         """
         Scan symbols for trading opportunities based on tastylive criteria
@@ -973,19 +2016,17 @@ class TastytradeBot:
 
                     options = chain[target_exp]
 
-                    # Get puts only for short put strategy
-                    puts = [opt for opt in options if opt.option_type == 'P']
-                    if not puts:
-                        continue
+                    # Build maps for all options (puts and calls)
+                    opt_by_streamer = {opt.streamer_symbol: opt for opt in options}
 
-                    # Stream Greeks to find ~30 delta put
+                    # Stream Greeks for all options
                     async with DXLinkStreamer(self.session) as streamer:
-                        await streamer.subscribe(Greeks, [opt.streamer_symbol for opt in puts])
+                        await streamer.subscribe(Greeks, [opt.streamer_symbol for opt in options])
 
-                        # Collect Greeks for all puts
+                        # Collect Greeks
                         option_greeks = {}
                         timeout_count = 0
-                        while len(option_greeks) < len(puts) and timeout_count < 50:
+                        while len(option_greeks) < len(options) and timeout_count < 100:
                             try:
                                 greeks_data = await asyncio.wait_for(
                                     streamer.get_event(Greeks), timeout=0.5
@@ -995,86 +2036,109 @@ class TastytradeBot:
                                 timeout_count += 1
                                 continue
 
-                        # Find the put closest to 30 delta
-                        target_delta = Decimal("-0.30")
-                        best_option = None
-                        best_delta_diff = Decimal("1.0")
-                        best_greeks = None
+                        # Subscribe to quotes for all options
+                        await streamer.subscribe(Quote, [opt.streamer_symbol for opt in options])
 
-                        for opt in puts:
+                        # Collect quotes
+                        option_quotes = {}
+                        timeout_count = 0
+                        while len(option_quotes) < len(options) and timeout_count < 100:
+                            try:
+                                quote = await asyncio.wait_for(
+                                    streamer.get_event(Quote), timeout=0.5
+                                )
+                                option_quotes[quote.event_symbol] = quote
+                            except asyncio.TimeoutError:
+                                timeout_count += 1
+                                continue
+
+                        # Build greeks and quotes by strike maps
+                        greeks_by_strike = {}
+                        quotes_by_strike = {}
+
+                        for opt in options:
+                            strike = opt.strike_price
                             if opt.streamer_symbol in option_greeks:
-                                g = option_greeks[opt.streamer_symbol]
-                                if g.delta is not None:
-                                    delta = Decimal(str(g.delta))
-                                    delta_diff = abs(delta - target_delta)
-                                    if delta_diff < best_delta_diff:
-                                        best_delta_diff = delta_diff
-                                        best_option = opt
-                                        best_greeks = g
+                                greeks_by_strike[strike] = option_greeks[opt.streamer_symbol]
+                            if opt.streamer_symbol in option_quotes:
+                                q = option_quotes[opt.streamer_symbol]
+                                quotes_by_strike[strike] = (
+                                    Decimal(str(q.bid_price or 0)),
+                                    Decimal(str(q.ask_price or 0))
+                                )
 
-                        if best_option is None or best_greeks is None:
-                            logger.debug(f"No suitable delta found for {symbol}")
+                        # Evaluate all strategies and get top 3 candidates
+                        candidates = self._evaluate_strategies_for_symbol(
+                            symbol=symbol,
+                            options=options,
+                            greeks_by_strike=greeks_by_strike,
+                            quotes_by_strike=quotes_by_strike,
+                            iv_rank=iv_rank,
+                            target_exp=target_exp,
+                            max_candidates=3
+                        )
+
+                        if not candidates:
+                            logger.debug(f"No valid candidates found for {symbol}")
                             continue
 
-                        # Get quote for credit pricing
-                        await streamer.subscribe(Quote, [best_option.streamer_symbol])
-                        try:
-                            quote = await asyncio.wait_for(
-                                streamer.get_event(Quote), timeout=2.0
-                            )
-                            # Use mid price for credit estimate
-                            bid = Decimal(str(quote.bid_price or 0))
-                            ask = Decimal(str(quote.ask_price or 0))
-                            credit = (bid + ask) / 2
-                        except asyncio.TimeoutError:
-                            logger.warning(f"Quote timeout for {best_option.symbol}")
-                            credit = Decimal("0")
+                        # Log all candidates for comparison
+                        logger.info(f"{symbol} - Top {len(candidates)} strategies:")
+                        for i, cand in enumerate(candidates, 1):
+                            ror = cand.return_on_risk()
+                            if cand.strategy == StrategyType.IRON_CONDOR:
+                                logger.info(f"  {i}. {cand.strategy.value}: "
+                                           f"{cand.put_short_strike}P/{cand.put_long_strike}P + "
+                                           f"{cand.call_short_strike}C/{cand.call_long_strike}C | "
+                                           f"Credit=${cand.net_credit:.2f} | MaxLoss=${cand.max_loss:.2f} | "
+                                           f"POP={cand.probability_of_profit:.0%} | RoR={ror:.1f}% | "
+                                           f"Kelly={cand.score:.3f}")
+                            else:
+                                logger.info(f"  {i}. {cand.strategy.value}: "
+                                           f"{cand.short_strike}/{cand.long_strike} | "
+                                           f"Credit=${cand.net_credit:.2f} | MaxLoss=${cand.max_loss:.2f} | "
+                                           f"POP={cand.probability_of_profit:.0%} | RoR={ror:.1f}% | "
+                                           f"Kelly={cand.score:.3f}")
 
-                        # Calculate max loss for cash-secured put
-                        max_loss = (best_option.strike_price * 100) - (credit * 100)
-
-                        dte = (target_exp - date.today()).days
-
-                        # Calculate probability OTM from delta
-                        prob_otm = Decimal("1") + Decimal(str(best_greeks.delta or -0.30))
-
-                        legs = [{
-                            'symbol': best_option.symbol,
-                            'streamer_symbol': best_option.streamer_symbol,
-                            'option_type': 'PUT',
-                            'strike': str(best_option.strike_price),
-                            'expiration': str(target_exp),
-                            'action': 'SELL_TO_OPEN',
-                            'quantity': 1,
-                            'credit': str(credit),
-                            'max_loss': str(max_loss),
-                            'dte': dte
-                        }]
-
-                        greeks = {
-                            'delta': float(best_greeks.delta or 0),
-                            'theta': float(best_greeks.theta or 0),
-                            'vega': float(best_greeks.vega or 0),
-                            'gamma': float(best_greeks.gamma or 0),
-                            'pop': float(prob_otm)
-                        }
+                        # Select the best candidate (highest Kelly score)
+                        best = candidates[0]
+                        dte = best.dte
 
                         # Get Claude's analysis if available
                         claude_analysis = None
                         if self.claude_advisor:
                             try:
-                                # Build option chain summary for Claude
-                                chain_summary = {
-                                    'target_expiration': str(target_exp),
-                                    'dte': dte,
-                                    'selected_strike': str(best_option.strike_price),
-                                    'selected_delta': float(best_greeks.delta or 0),
-                                    'credit': str(credit),
-                                    'max_loss': str(max_loss),
-                                    'prob_otm': float(prob_otm)
-                                }
+                                # Build strategy-specific summary
+                                if best.strategy == StrategyType.IRON_CONDOR:
+                                    chain_summary = {
+                                        'target_expiration': str(target_exp),
+                                        'dte': dte,
+                                        'strategy': 'iron_condor',
+                                        'put_short_strike': str(best.put_short_strike),
+                                        'put_long_strike': str(best.put_long_strike),
+                                        'call_short_strike': str(best.call_short_strike),
+                                        'call_long_strike': str(best.call_long_strike),
+                                        'net_credit': str(best.net_credit),
+                                        'max_loss': str(best.max_loss),
+                                        'prob_otm': float(best.probability_of_profit),
+                                        'kelly_score': float(best.score),
+                                        'alternatives_evaluated': len(candidates)
+                                    }
+                                else:
+                                    chain_summary = {
+                                        'target_expiration': str(target_exp),
+                                        'dte': dte,
+                                        'strategy': best.strategy.value,
+                                        'short_strike': str(best.short_strike),
+                                        'long_strike': str(best.long_strike),
+                                        'spread_width': str(best.spread_width),
+                                        'net_credit': str(best.net_credit),
+                                        'max_loss': str(best.max_loss),
+                                        'prob_otm': float(best.probability_of_profit),
+                                        'kelly_score': float(best.score),
+                                        'alternatives_evaluated': len(candidates)
+                                    }
 
-                                # Get portfolio context
                                 portfolio_context = {
                                     'portfolio_delta': float(self.portfolio_state.portfolio_delta),
                                     'open_positions': self.portfolio_state.open_positions,
@@ -1089,7 +2153,7 @@ class TastytradeBot:
                                 claude_analysis = await self.claude_advisor.analyze_opportunity(
                                     symbol=symbol,
                                     iv_rank=float(iv_rank),
-                                    current_price=float(best_option.strike_price),  # Approximate
+                                    current_price=float(best.short_strike or best.put_short_strike or 0),
                                     option_chain_summary=chain_summary,
                                     portfolio_state=portfolio_context
                                 )
@@ -1113,18 +2177,20 @@ class TastytradeBot:
 
                             except Exception as e:
                                 logger.warning(f"Claude analysis failed for {symbol}: {e}")
-                                # Continue with rule-based approach if Claude fails
 
+                        # Create proposal from best candidate
                         proposal = await self.propose_trade(
-                            strategy=StrategyType.SHORT_PUT,
+                            strategy=best.strategy,
                             underlying=symbol,
-                            legs=legs,
-                            greeks=greeks,
+                            legs=best.legs,
+                            greeks=best.greeks,
                             iv_rank=iv_rank,
                             claude_analysis=claude_analysis
                         )
 
                         if proposal:
+                            logger.info(f"Selected {best.strategy.value} for {symbol} "
+                                       f"(Kelly={best.score:.3f}, Credit=${best.net_credit:.2f})")
                             opportunities.append(proposal)
 
                 except Exception as e:
@@ -1140,10 +2206,10 @@ class TastytradeBot:
 
     async def _scan_with_mock_data(self, symbols: List[str]) -> List[TradeProposal]:
         """
-        Scan for opportunities using mock market data.
+        Scan for opportunities using mock market data with multi-strategy evaluation.
 
-        This method is used when use_mock_data is enabled, allowing
-        testing of the full bot workflow without real market data access.
+        Evaluates put spreads, call spreads, and iron condors for each symbol,
+        ranking them by Kelly Criterion score and returning the best candidates.
         """
         opportunities = []
 
@@ -1151,7 +2217,7 @@ class TastytradeBot:
             logger.error("Mock provider not available")
             return opportunities
 
-        logger.info(f"Scanning with MOCK DATA: {symbols}")
+        logger.info(f"Scanning with MOCK DATA (multi-strategy): {symbols}")
 
         # Get mock metrics for all symbols
         metrics = self.mock_provider.get_market_metrics(symbols)
@@ -1181,70 +2247,60 @@ class TastytradeBot:
                 target_exp = list(chain.keys())[0]
                 options = chain[target_exp]
 
-                # Get puts only for short put strategy
-                puts = [opt for opt in options if opt.option_type == 'P']
-                if not puts:
-                    continue
+                # Build greeks and quotes maps for all options
+                greeks_by_strike = {}
+                quotes_by_strike = {}
 
-                # Calculate Greeks for all puts and find ~30 delta
-                target_delta = Decimal("-0.30")
-                best_option = None
-                best_delta_diff = Decimal("1.0")
-                best_greeks = None
+                for opt in options:
+                    strike = opt.strike_price
+                    greeks_by_strike[strike] = self.mock_provider.get_greeks(opt)
+                    quote = self.mock_provider.get_quote(
+                        symbol=opt.symbol,
+                        is_option=True,
+                        option=opt
+                    )
+                    quotes_by_strike[strike] = (
+                        Decimal(str(quote.bid_price)),
+                        Decimal(str(quote.ask_price))
+                    )
 
-                for opt in puts:
-                    mock_greeks = self.mock_provider.get_greeks(opt)
-                    delta = Decimal(str(mock_greeks.delta))
-                    delta_diff = abs(delta - target_delta)
-
-                    if delta_diff < best_delta_diff:
-                        best_delta_diff = delta_diff
-                        best_option = opt
-                        best_greeks = mock_greeks
-
-                if best_option is None or best_greeks is None:
-                    logger.debug(f"No suitable delta found for {symbol} (mock data)")
-                    continue
-
-                # Get mock quote for credit pricing
-                mock_quote = self.mock_provider.get_quote(
-                    symbol=best_option.symbol,
-                    is_option=True,
-                    option=best_option
+                # Evaluate all strategies and get top 3 candidates
+                candidates = self._evaluate_strategies_for_symbol(
+                    symbol=symbol,
+                    options=options,
+                    greeks_by_strike=greeks_by_strike,
+                    quotes_by_strike=quotes_by_strike,
+                    iv_rank=iv_rank,
+                    target_exp=target_exp,
+                    max_candidates=3
                 )
 
-                bid = Decimal(str(mock_quote.bid_price))
-                ask = Decimal(str(mock_quote.ask_price))
-                credit = (bid + ask) / 2
+                if not candidates:
+                    logger.debug(f"No valid candidates found for {symbol}")
+                    continue
 
-                # Calculate max loss for cash-secured put
-                max_loss = (best_option.strike_price * 100) - (credit * 100)
+                # Log all candidates for comparison
+                logger.info(f"[MOCK] {symbol} - Top {len(candidates)} strategies:")
+                for i, cand in enumerate(candidates, 1):
+                    ror = cand.return_on_risk()
+                    ev = cand.expected_value()
+                    if cand.strategy == StrategyType.IRON_CONDOR:
+                        logger.info(f"  {i}. {cand.strategy.value}: "
+                                   f"{cand.put_short_strike}P/{cand.put_long_strike}P + "
+                                   f"{cand.call_short_strike}C/{cand.call_long_strike}C | "
+                                   f"Credit=${cand.net_credit:.2f} | MaxLoss=${cand.max_loss:.2f} | "
+                                   f"POP={cand.probability_of_profit:.0%} | RoR={ror:.1f}% | "
+                                   f"Kelly={cand.score:.3f}")
+                    else:
+                        logger.info(f"  {i}. {cand.strategy.value}: "
+                                   f"{cand.short_strike}/{cand.long_strike} | "
+                                   f"Credit=${cand.net_credit:.2f} | MaxLoss=${cand.max_loss:.2f} | "
+                                   f"POP={cand.probability_of_profit:.0%} | RoR={ror:.1f}% | "
+                                   f"Kelly={cand.score:.3f}")
 
-                dte = (target_exp - date.today()).days
-
-                # Calculate probability OTM from delta
-                prob_otm = Decimal("1") + Decimal(str(best_greeks.delta))
-
-                legs = [{
-                    'symbol': best_option.symbol,
-                    'streamer_symbol': best_option.streamer_symbol,
-                    'option_type': 'PUT',
-                    'strike': str(best_option.strike_price),
-                    'expiration': str(target_exp),
-                    'action': 'SELL_TO_OPEN',
-                    'quantity': 1,
-                    'credit': str(credit),
-                    'max_loss': str(max_loss),
-                    'dte': dte
-                }]
-
-                greeks = {
-                    'delta': float(best_greeks.delta),
-                    'theta': float(best_greeks.theta),
-                    'vega': float(best_greeks.vega),
-                    'gamma': float(best_greeks.gamma),
-                    'pop': float(prob_otm)
-                }
+                # Select the best candidate (highest Kelly score)
+                best = candidates[0]
+                dte = best.dte
 
                 # Get Claude's analysis if available
                 claude_analysis = None
@@ -1252,15 +2308,36 @@ class TastytradeBot:
                     try:
                         underlying_price = self.mock_provider.get_underlying_price(symbol)
 
-                        chain_summary = {
-                            'target_expiration': str(target_exp),
-                            'dte': dte,
-                            'selected_strike': str(best_option.strike_price),
-                            'selected_delta': float(best_greeks.delta),
-                            'credit': str(credit),
-                            'max_loss': str(max_loss),
-                            'prob_otm': float(prob_otm)
-                        }
+                        # Build strategy-specific summary
+                        if best.strategy == StrategyType.IRON_CONDOR:
+                            chain_summary = {
+                                'target_expiration': str(target_exp),
+                                'dte': dte,
+                                'strategy': 'iron_condor',
+                                'put_short_strike': str(best.put_short_strike),
+                                'put_long_strike': str(best.put_long_strike),
+                                'call_short_strike': str(best.call_short_strike),
+                                'call_long_strike': str(best.call_long_strike),
+                                'net_credit': str(best.net_credit),
+                                'max_loss': str(best.max_loss),
+                                'prob_otm': float(best.probability_of_profit),
+                                'kelly_score': float(best.score),
+                                'alternatives_evaluated': len(candidates)
+                            }
+                        else:
+                            chain_summary = {
+                                'target_expiration': str(target_exp),
+                                'dte': dte,
+                                'strategy': best.strategy.value,
+                                'short_strike': str(best.short_strike),
+                                'long_strike': str(best.long_strike),
+                                'spread_width': str(best.spread_width),
+                                'net_credit': str(best.net_credit),
+                                'max_loss': str(best.max_loss),
+                                'prob_otm': float(best.probability_of_profit),
+                                'kelly_score': float(best.score),
+                                'alternatives_evaluated': len(candidates)
+                            }
 
                         portfolio_context = {
                             'portfolio_delta': float(self.portfolio_state.portfolio_delta),
@@ -1301,22 +2378,25 @@ class TastytradeBot:
                     except Exception as e:
                         logger.warning(f"Claude analysis failed for {symbol}: {e}")
 
+                # Create proposal from best candidate
                 proposal = await self.propose_trade(
-                    strategy=StrategyType.SHORT_PUT,
+                    strategy=best.strategy,
                     underlying=symbol,
-                    legs=legs,
-                    greeks=greeks,
+                    legs=best.legs,
+                    greeks=best.greeks,
                     iv_rank=iv_rank,
                     claude_analysis=claude_analysis
                 )
 
                 if proposal:
-                    logger.info(f"[MOCK] Found opportunity: {symbol} PUT @ {best_option.strike_price} "
-                               f"IV Rank={iv_rank}%, Delta={best_greeks.delta:.2f}, Credit=${credit:.2f}")
+                    logger.info(f"[MOCK] Selected {best.strategy.value} for {symbol} "
+                               f"(Kelly={best.score:.3f}, Credit=${best.net_credit:.2f})")
                     opportunities.append(proposal)
 
             except Exception as e:
                 logger.error(f"Error scanning {symbol} with mock data: {e}")
+                import traceback
+                logger.debug(traceback.format_exc())
                 continue
 
         logger.info(f"Mock scan complete: found {len(opportunities)} opportunities")
@@ -1650,6 +2730,176 @@ class TastytradeBot:
         except Exception as e:
             logger.error(f"Unexpected error exporting state: {e}")
             return False
+
+    # =========================================================================
+    # CHATBOT HELPER METHODS
+    # =========================================================================
+
+    async def get_position_by_symbol(self, symbol: str) -> Optional[Dict[str, Any]]:
+        """
+        Get position details for a specific symbol.
+
+        Args:
+            symbol: The underlying symbol to look up
+
+        Returns:
+            Position details dict or None if not found
+        """
+        if not self.session:
+            # Return mock position data if in mock mode
+            if self.use_mock_data:
+                return None  # No mock positions by default
+            return None
+
+        try:
+            from tastytrade import Account
+
+            if not await self.ensure_session_valid():
+                return None
+
+            account = Account.get(self.session)[0]
+            positions = account.get_positions(self.session)
+
+            for pos in positions:
+                if pos.underlying_symbol == symbol:
+                    return {
+                        'symbol': pos.symbol,
+                        'underlying': pos.underlying_symbol,
+                        'quantity': pos.quantity,
+                        'instrument_type': pos.instrument_type,
+                        'average_open_price': float(pos.average_open_price or 0),
+                        'close_price': float(pos.close_price or 0),
+                        'pnl': float((pos.close_price or 0) - (pos.average_open_price or 0)) * pos.quantity * 100,
+                        'pnl_pct': 0,  # Would need more data to calculate
+                        'dte': 0,  # Would need option expiration
+                        'is_tested': False  # Would need current price vs strike
+                    }
+
+            return None
+
+        except Exception as e:
+            logger.error(f"Error getting position for {symbol}: {e}")
+            return None
+
+    async def get_iv_rank(self, symbol: str) -> Optional[Decimal]:
+        """
+        Get IV Rank for a specific symbol.
+
+        Args:
+            symbol: The symbol to get IV rank for
+
+        Returns:
+            IV Rank as Decimal or None if unavailable
+        """
+        # Use mock data if enabled
+        if self.use_mock_data and self.mock_provider:
+            mock_data = self.mock_provider.get_symbol_data(symbol)
+            if mock_data:
+                return Decimal(str(mock_data.get('iv_rank', 0)))
+            return None
+
+        if not self.session:
+            return None
+
+        try:
+            from tastytrade.metrics import get_market_metrics
+
+            if not await self.ensure_session_valid():
+                return None
+
+            metrics = get_market_metrics(self.session, [symbol])
+            if metrics:
+                iv_rank = metrics[0].implied_volatility_index_rank
+                if iv_rank is not None:
+                    return Decimal(str(iv_rank))
+
+            return None
+
+        except Exception as e:
+            logger.error(f"Error getting IV rank for {symbol}: {e}")
+            return None
+
+    async def research_strategy(
+        self,
+        symbol: str,
+        strategy: str = "short_put_spread"
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Research a strategy on a symbol without creating a trade.
+
+        Args:
+            symbol: The underlying symbol
+            strategy: Strategy type to research
+
+        Returns:
+            Research results dict or None if unavailable
+        """
+        result = {
+            "symbol": symbol,
+            "strategy": strategy,
+            "iv_rank": 0.0,
+            "put_side": None,
+            "call_side": None,
+            "metrics": {},
+            "rationale": "",
+            "would_meet_criteria": False
+        }
+
+        # Get IV rank first
+        iv_rank = await self.get_iv_rank(symbol)
+        if iv_rank is None:
+            result["rationale"] = f"Could not get IV rank for {symbol}"
+            return result
+
+        result["iv_rank"] = float(iv_rank)
+
+        if iv_rank < self.risk_params.min_iv_rank:
+            result["rationale"] = f"IV Rank ({iv_rank:.1f}%) below {self.risk_params.min_iv_rank}% threshold"
+            return result
+
+        # Use mock data for structure if available
+        if self.use_mock_data and self.mock_provider:
+            mock_data = self.mock_provider.get_symbol_data(symbol)
+            if mock_data:
+                price = float(mock_data.get('price', 100))
+                strike_interval = float(mock_data.get('option_strike_interval', 1.0))
+
+                # Build approximate structure
+                if strategy in ('short_put', 'short_put_spread', 'iron_condor'):
+                    short_put = round(price * 0.95 / strike_interval) * strike_interval
+                    long_put = short_put - (strike_interval * 5)
+                    result["put_side"] = {
+                        "short_strike": short_put,
+                        "long_strike": long_put
+                    }
+
+                if strategy in ('short_call', 'short_call_spread', 'iron_condor'):
+                    short_call = round(price * 1.05 / strike_interval) * strike_interval
+                    long_call = short_call + (strike_interval * 5)
+                    result["call_side"] = {
+                        "short_strike": short_call,
+                        "long_strike": long_call
+                    }
+
+                # Estimate metrics
+                spread_width = strike_interval * 5
+                estimated_credit = spread_width * 0.33
+                max_loss = (spread_width * 100) - (estimated_credit * 100)
+
+                result["metrics"] = {
+                    "net_credit": estimated_credit,
+                    "max_loss": max_loss,
+                    "pop": 0.70,
+                    "dte": 45
+                }
+
+                result["would_meet_criteria"] = True
+                result["rationale"] = (
+                    f"IV Rank at {iv_rank:.1f}% meets criteria. "
+                    f"Estimated credit: ${estimated_credit:.2f}, Max loss: ${max_loss:.2f}"
+                )
+
+        return result
 
 
 class TradingBotCLI:
