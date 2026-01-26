@@ -39,6 +39,23 @@ try:
 except ImportError:
     pass  # python-dotenv not installed, use system env vars
 
+# Import Claude Trade Advisor
+try:
+    from claude_advisor import ClaudeTradeAdvisor, ClaudeAnalysis, ManagementAnalysis
+    CLAUDE_AVAILABLE = True
+except ImportError:
+    CLAUDE_AVAILABLE = False
+    ClaudeTradeAdvisor = None
+
+# Import Mock Data Provider
+try:
+    from mock_data import MockDataProvider, create_mock_provider
+    MOCK_DATA_AVAILABLE = True
+except ImportError:
+    MOCK_DATA_AVAILABLE = False
+    MockDataProvider = None
+    create_mock_provider = None
+
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
@@ -136,6 +153,9 @@ class TradeProposal:
     approval_timestamp: Optional[datetime] = None
     rejection_reason: Optional[str] = None
     execution_result: Optional[dict] = None
+    # Claude AI analysis
+    claude_analysis: Optional[Dict[str, Any]] = None
+    claude_confidence: Optional[int] = None
 
 
 @dataclass 
@@ -178,31 +198,68 @@ class TastytradeBot:
         session=None,
         risk_params: Optional[RiskParameters] = None,
         approval_callback: Optional[Callable[[TradeProposal], bool]] = None,
-        sandbox_mode: bool = True
+        sandbox_mode: bool = True,
+        claude_config: Optional[Dict[str, Any]] = None,
+        config: Optional[Dict[str, Any]] = None
     ):
         """
         Initialize the trading bot
-        
+
         Args:
             session: Tastytrade session object
             risk_params: Risk management parameters
             approval_callback: Function to call for trade approval
             sandbox_mode: If True, use sandbox environment
+            claude_config: Configuration for Claude AI advisor
+            config: Full configuration dict (for mock data settings, etc.)
         """
         self.session = session
         self.risk_params = risk_params or RiskParameters()
         self.approval_callback = approval_callback
         self.sandbox_mode = sandbox_mode
-        
+        self.config = config or {}
+
         # State tracking
         self.portfolio_state = PortfolioState()
         self.pending_trades: List[TradeProposal] = []
         self.trade_history: List[TradeProposal] = []
-        
+
         # Watchlist for scanning
         self.watchlist: List[str] = []
-        
-        logger.info(f"TastytradeBot initialized (sandbox_mode={sandbox_mode})")
+
+        # Initialize Mock Data Provider (for sandbox testing without real market data)
+        self.mock_provider = None
+        self.use_mock_data = False
+        mock_config = self.config.get('mock_data', {})
+        if MOCK_DATA_AVAILABLE and mock_config.get('enabled', False):
+            if sandbox_mode:
+                self.mock_provider = MockDataProvider(self.config)
+                self.use_mock_data = True
+                logger.info("Mock data provider initialized (sandbox mode with mock market data)")
+            else:
+                logger.warning("Mock data is only available in sandbox mode")
+        elif not MOCK_DATA_AVAILABLE and mock_config.get('enabled', False):
+            logger.warning("Mock data requested but mock_data module not available")
+
+        # Initialize Claude AI Trade Advisor
+        self.claude_advisor = None
+        self.claude_config = claude_config or {}
+        if CLAUDE_AVAILABLE and self.claude_config.get('enabled', True):
+            self.claude_advisor = ClaudeTradeAdvisor(
+                model=self.claude_config.get('model', 'claude-sonnet-4-20250514'),
+                max_tokens=self.claude_config.get('max_tokens', 1024),
+                temperature=self.claude_config.get('temperature', 0.3)
+            )
+            if self.claude_advisor.is_available:
+                logger.info("Claude AI Trade Advisor initialized")
+            else:
+                logger.warning("Claude AI Trade Advisor not available (missing API key)")
+                self.claude_advisor = None
+        elif not CLAUDE_AVAILABLE:
+            logger.info("Claude advisor module not available")
+
+        mock_status = ", mock_data=enabled" if self.use_mock_data else ""
+        logger.info(f"TastytradeBot initialized (sandbox_mode={sandbox_mode}{mock_status})")
     
     async def connect(
         self,
@@ -591,30 +648,32 @@ class TastytradeBot:
         underlying: str,
         legs: List[dict],
         greeks: dict,
-        iv_rank: Decimal
+        iv_rank: Decimal,
+        claude_analysis: Optional[Any] = None
     ) -> Optional[TradeProposal]:
         """
         Create a trade proposal for approval
-        
+
         Args:
             strategy: Type of options strategy
             underlying: Underlying symbol (e.g., 'SPY')
             legs: List of option legs with strike, expiration, etc.
             greeks: Position Greeks (delta, theta, vega, gamma)
             iv_rank: Current IV Rank percentage
-        
+            claude_analysis: Optional Claude AI analysis of the opportunity
+
         Returns:
             TradeProposal if created, None if rejected by risk checks
         """
         import uuid
-        
+
         # Calculate expected credit and max loss from legs
         expected_credit = sum(Decimal(str(leg.get('credit', 0))) for leg in legs)
         max_loss = sum(Decimal(str(leg.get('max_loss', 0))) for leg in legs)
-        
+
         # Get DTE from first leg
         dte = legs[0].get('dte', self.risk_params.target_dte) if legs else self.risk_params.target_dte
-        
+
         # Create proposal
         proposal = TradeProposal(
             id=str(uuid.uuid4())[:8],
@@ -632,6 +691,17 @@ class TastytradeBot:
             vega=Decimal(str(greeks.get('vega', 0))),
             rationale=""
         )
+
+        # Store Claude analysis if available
+        if claude_analysis:
+            proposal.claude_analysis = {
+                'recommendation': claude_analysis.recommendation,
+                'suggested_strategy': claude_analysis.suggested_strategy,
+                'suggested_delta': claude_analysis.suggested_delta,
+                'key_risks': claude_analysis.key_risks,
+                'rationale': claude_analysis.rationale
+            }
+            proposal.claude_confidence = claude_analysis.confidence
         
         # Generate rationale
         proposal.rationale = self.generate_trade_rationale(proposal)
@@ -661,11 +731,49 @@ class TastytradeBot:
         if proposal.status != TradeStatus.PENDING_APPROVAL:
             logger.warning(f"Trade {proposal.id} not in pending status")
             return False
-        
+
+        # Get Claude's summary if available
+        ai_summary = None
+        if self.claude_advisor:
+            try:
+                portfolio_context = {
+                    'portfolio_delta': float(self.portfolio_state.portfolio_delta),
+                    'open_positions': self.portfolio_state.open_positions,
+                    'buying_power': float(self.portfolio_state.buying_power),
+                    'net_liquidating_value': float(self.portfolio_state.net_liquidating_value),
+                    'daily_pnl': float(self.portfolio_state.daily_pnl)
+                }
+                ai_summary = await self.claude_advisor.generate_approval_summary(
+                    proposal=proposal,
+                    portfolio_context=portfolio_context
+                )
+            except Exception as e:
+                logger.warning(f"Failed to generate Claude summary: {e}")
+
         # Display proposal details
         print("\n" + "="*60)
         print("TRADE APPROVAL REQUEST")
         print("="*60)
+
+        # Show Claude's AI analysis first if available
+        if ai_summary:
+            print("\n[AI ANALYSIS]")
+            print("-" * 40)
+            print(ai_summary)
+            print("-" * 40)
+        elif proposal.claude_analysis:
+            # Show stored analysis if live summary failed
+            print("\n[AI ANALYSIS]")
+            print("-" * 40)
+            print(f"Recommendation: {proposal.claude_analysis.get('recommendation', 'N/A')}")
+            print(f"Confidence: {proposal.claude_confidence}/10")
+            print(f"Rationale: {proposal.claude_analysis.get('rationale', 'N/A')}")
+            if proposal.claude_analysis.get('key_risks'):
+                print("Key Risks:")
+                for risk in proposal.claude_analysis['key_risks']:
+                    print(f"  - {risk}")
+            print("-" * 40)
+
         print(f"\nProposal ID: {proposal.id}")
         print(f"Timestamp: {proposal.timestamp}")
         print(f"\n{proposal.rationale}")
@@ -813,8 +921,15 @@ class TastytradeBot:
         2. Options at ~45 DTE
         3. Strikes at ~30 delta (or 16 delta for conservative)
         4. Sufficient liquidity
+
+        When use_mock_data is enabled (sandbox mode), uses mock market data
+        instead of real streaming data.
         """
         opportunities = []
+
+        # Use mock data path if enabled
+        if self.use_mock_data and self.mock_provider:
+            return await self._scan_with_mock_data(symbols)
 
         if not self.session:
             logger.warning("No session - cannot scan for opportunities")
@@ -944,12 +1059,69 @@ class TastytradeBot:
                             'pop': float(prob_otm)
                         }
 
+                        # Get Claude's analysis if available
+                        claude_analysis = None
+                        if self.claude_advisor:
+                            try:
+                                # Build option chain summary for Claude
+                                chain_summary = {
+                                    'target_expiration': str(target_exp),
+                                    'dte': dte,
+                                    'selected_strike': str(best_option.strike_price),
+                                    'selected_delta': float(best_greeks.delta or 0),
+                                    'credit': str(credit),
+                                    'max_loss': str(max_loss),
+                                    'prob_otm': float(prob_otm)
+                                }
+
+                                # Get portfolio context
+                                portfolio_context = {
+                                    'portfolio_delta': float(self.portfolio_state.portfolio_delta),
+                                    'open_positions': self.portfolio_state.open_positions,
+                                    'buying_power': float(self.portfolio_state.buying_power),
+                                    'buying_power_used_pct': float(
+                                        (1 - self.portfolio_state.buying_power /
+                                         max(self.portfolio_state.net_liquidating_value, Decimal('1'))) * 100
+                                    ) if self.portfolio_state.net_liquidating_value > 0 else 0,
+                                    'daily_pnl': float(self.portfolio_state.daily_pnl)
+                                }
+
+                                claude_analysis = await self.claude_advisor.analyze_opportunity(
+                                    symbol=symbol,
+                                    iv_rank=float(iv_rank),
+                                    current_price=float(best_option.strike_price),  # Approximate
+                                    option_chain_summary=chain_summary,
+                                    portfolio_state=portfolio_context
+                                )
+
+                                if claude_analysis:
+                                    confidence_threshold = self.claude_config.get(
+                                        'confidence_thresholds', {}
+                                    ).get('opportunity_threshold', 7)
+
+                                    if claude_analysis.recommendation == 'SKIP':
+                                        logger.info(f"Claude recommends SKIP for {symbol}: {claude_analysis.rationale}")
+                                        continue
+                                    elif claude_analysis.recommendation == 'WAIT':
+                                        logger.info(f"Claude recommends WAIT for {symbol}: {claude_analysis.rationale}")
+                                        continue
+                                    elif claude_analysis.confidence < confidence_threshold:
+                                        logger.info(f"Claude confidence {claude_analysis.confidence} below threshold for {symbol}")
+                                        continue
+
+                                    logger.info(f"Claude recommends TRADE for {symbol} (confidence: {claude_analysis.confidence}/10)")
+
+                            except Exception as e:
+                                logger.warning(f"Claude analysis failed for {symbol}: {e}")
+                                # Continue with rule-based approach if Claude fails
+
                         proposal = await self.propose_trade(
                             strategy=StrategyType.SHORT_PUT,
                             underlying=symbol,
                             legs=legs,
                             greeks=greeks,
-                            iv_rank=iv_rank
+                            iv_rank=iv_rank,
+                            claude_analysis=claude_analysis
                         )
 
                         if proposal:
@@ -964,6 +1136,190 @@ class TastytradeBot:
         except Exception as e:
             logger.error(f"Scan failed: {e}")
 
+        return opportunities
+
+    async def _scan_with_mock_data(self, symbols: List[str]) -> List[TradeProposal]:
+        """
+        Scan for opportunities using mock market data.
+
+        This method is used when use_mock_data is enabled, allowing
+        testing of the full bot workflow without real market data access.
+        """
+        opportunities = []
+
+        if not self.mock_provider:
+            logger.error("Mock provider not available")
+            return opportunities
+
+        logger.info(f"Scanning with MOCK DATA: {symbols}")
+
+        # Get mock metrics for all symbols
+        metrics = self.mock_provider.get_market_metrics(symbols)
+        iv_ranks = {m.symbol: Decimal(str(m.implied_volatility_index_rank))
+                   for m in metrics}
+
+        for symbol in symbols:
+            try:
+                # Get IV Rank from mock metrics
+                iv_rank = iv_ranks.get(symbol, Decimal("0"))
+
+                if iv_rank < self.risk_params.min_iv_rank:
+                    logger.debug(f"{symbol} IV Rank {iv_rank} too low (mock data)")
+                    continue
+
+                # Get mock option chain
+                chain = self.mock_provider.get_option_chain(
+                    symbol,
+                    target_dte=self.risk_params.target_dte
+                )
+
+                if not chain:
+                    logger.debug(f"No mock options for {symbol}")
+                    continue
+
+                # Get first (and likely only) expiration date
+                target_exp = list(chain.keys())[0]
+                options = chain[target_exp]
+
+                # Get puts only for short put strategy
+                puts = [opt for opt in options if opt.option_type == 'P']
+                if not puts:
+                    continue
+
+                # Calculate Greeks for all puts and find ~30 delta
+                target_delta = Decimal("-0.30")
+                best_option = None
+                best_delta_diff = Decimal("1.0")
+                best_greeks = None
+
+                for opt in puts:
+                    mock_greeks = self.mock_provider.get_greeks(opt)
+                    delta = Decimal(str(mock_greeks.delta))
+                    delta_diff = abs(delta - target_delta)
+
+                    if delta_diff < best_delta_diff:
+                        best_delta_diff = delta_diff
+                        best_option = opt
+                        best_greeks = mock_greeks
+
+                if best_option is None or best_greeks is None:
+                    logger.debug(f"No suitable delta found for {symbol} (mock data)")
+                    continue
+
+                # Get mock quote for credit pricing
+                mock_quote = self.mock_provider.get_quote(
+                    symbol=best_option.symbol,
+                    is_option=True,
+                    option=best_option
+                )
+
+                bid = Decimal(str(mock_quote.bid_price))
+                ask = Decimal(str(mock_quote.ask_price))
+                credit = (bid + ask) / 2
+
+                # Calculate max loss for cash-secured put
+                max_loss = (best_option.strike_price * 100) - (credit * 100)
+
+                dte = (target_exp - date.today()).days
+
+                # Calculate probability OTM from delta
+                prob_otm = Decimal("1") + Decimal(str(best_greeks.delta))
+
+                legs = [{
+                    'symbol': best_option.symbol,
+                    'streamer_symbol': best_option.streamer_symbol,
+                    'option_type': 'PUT',
+                    'strike': str(best_option.strike_price),
+                    'expiration': str(target_exp),
+                    'action': 'SELL_TO_OPEN',
+                    'quantity': 1,
+                    'credit': str(credit),
+                    'max_loss': str(max_loss),
+                    'dte': dte
+                }]
+
+                greeks = {
+                    'delta': float(best_greeks.delta),
+                    'theta': float(best_greeks.theta),
+                    'vega': float(best_greeks.vega),
+                    'gamma': float(best_greeks.gamma),
+                    'pop': float(prob_otm)
+                }
+
+                # Get Claude's analysis if available
+                claude_analysis = None
+                if self.claude_advisor:
+                    try:
+                        underlying_price = self.mock_provider.get_underlying_price(symbol)
+
+                        chain_summary = {
+                            'target_expiration': str(target_exp),
+                            'dte': dte,
+                            'selected_strike': str(best_option.strike_price),
+                            'selected_delta': float(best_greeks.delta),
+                            'credit': str(credit),
+                            'max_loss': str(max_loss),
+                            'prob_otm': float(prob_otm)
+                        }
+
+                        portfolio_context = {
+                            'portfolio_delta': float(self.portfolio_state.portfolio_delta),
+                            'open_positions': self.portfolio_state.open_positions,
+                            'buying_power': float(self.portfolio_state.buying_power),
+                            'buying_power_used_pct': float(
+                                (1 - self.portfolio_state.buying_power /
+                                 max(self.portfolio_state.net_liquidating_value, Decimal('1'))) * 100
+                            ) if self.portfolio_state.net_liquidating_value > 0 else 0,
+                            'daily_pnl': float(self.portfolio_state.daily_pnl)
+                        }
+
+                        claude_analysis = await self.claude_advisor.analyze_opportunity(
+                            symbol=symbol,
+                            iv_rank=float(iv_rank),
+                            current_price=underlying_price,
+                            option_chain_summary=chain_summary,
+                            portfolio_state=portfolio_context
+                        )
+
+                        if claude_analysis:
+                            confidence_threshold = self.claude_config.get(
+                                'confidence_thresholds', {}
+                            ).get('opportunity_threshold', 7)
+
+                            if claude_analysis.recommendation == 'SKIP':
+                                logger.info(f"Claude recommends SKIP for {symbol}: {claude_analysis.rationale}")
+                                continue
+                            elif claude_analysis.recommendation == 'WAIT':
+                                logger.info(f"Claude recommends WAIT for {symbol}: {claude_analysis.rationale}")
+                                continue
+                            elif claude_analysis.confidence < confidence_threshold:
+                                logger.info(f"Claude confidence {claude_analysis.confidence} below threshold for {symbol}")
+                                continue
+
+                            logger.info(f"Claude recommends TRADE for {symbol} (confidence: {claude_analysis.confidence}/10)")
+
+                    except Exception as e:
+                        logger.warning(f"Claude analysis failed for {symbol}: {e}")
+
+                proposal = await self.propose_trade(
+                    strategy=StrategyType.SHORT_PUT,
+                    underlying=symbol,
+                    legs=legs,
+                    greeks=greeks,
+                    iv_rank=iv_rank,
+                    claude_analysis=claude_analysis
+                )
+
+                if proposal:
+                    logger.info(f"[MOCK] Found opportunity: {symbol} PUT @ {best_option.strike_price} "
+                               f"IV Rank={iv_rank}%, Delta={best_greeks.delta:.2f}, Credit=${credit:.2f}")
+                    opportunities.append(proposal)
+
+            except Exception as e:
+                logger.error(f"Error scanning {symbol} with mock data: {e}")
+                continue
+
+        logger.info(f"Mock scan complete: found {len(opportunities)} opportunities")
         return opportunities
     
     async def manage_positions(self) -> List[dict]:
@@ -1107,6 +1463,46 @@ class TastytradeBot:
                     recommendation['reason'] = "Position is being tested - monitor closely"
                     logger.warning(f"[MANAGE] {pos.symbol}: {recommendation['reason']}")
 
+                # Get Claude's analysis for positions needing action
+                if recommendation['action'] and self.claude_advisor:
+                    try:
+                        position_info = {
+                            'symbol': pos.symbol,
+                            'underlying': pos.underlying_symbol,
+                            'option_type': opt.option_type,
+                            'strike': float(opt.strike_price),
+                            'quantity': pos.quantity,
+                            'entry_credit': float(avg_open_price)
+                        }
+
+                        portfolio_context = {
+                            'open_positions': self.portfolio_state.open_positions,
+                            'portfolio_delta': float(self.portfolio_state.portfolio_delta),
+                            'daily_pnl': float(self.portfolio_state.daily_pnl)
+                        }
+
+                        claude_mgmt = await self.claude_advisor.evaluate_management_action(
+                            position=position_info,
+                            current_pnl_pct=float(pnl_percent),
+                            dte_remaining=dte,
+                            is_tested=is_tested,
+                            portfolio_context=portfolio_context
+                        )
+
+                        if claude_mgmt:
+                            recommendation['claude_action'] = claude_mgmt.action
+                            recommendation['claude_reasoning'] = claude_mgmt.reasoning
+                            recommendation['claude_confidence'] = claude_mgmt.confidence
+                            recommendation['claude_urgency'] = claude_mgmt.urgency
+                            if claude_mgmt.roll_suggestion:
+                                recommendation['claude_roll_suggestion'] = claude_mgmt.roll_suggestion
+
+                            logger.info(f"[CLAUDE] {pos.symbol}: {claude_mgmt.action} "
+                                       f"(confidence: {claude_mgmt.confidence}/10, urgency: {claude_mgmt.urgency})")
+
+                    except Exception as e:
+                        logger.warning(f"Claude management analysis failed for {pos.symbol}: {e}")
+
                 if recommendation['action']:
                     recommendations.append(recommendation)
 
@@ -1121,7 +1517,77 @@ class TastytradeBot:
             logger.error(f"Position management failed: {e}")
 
         return recommendations
-    
+
+    async def get_portfolio_analysis(self) -> str:
+        """
+        Get Claude's analysis of overall portfolio health
+
+        Returns:
+            Formatted portfolio analysis string
+        """
+        if not self.claude_advisor:
+            return "Portfolio analysis unavailable (Claude not configured)"
+
+        await self.update_portfolio_state()
+
+        # Get positions for analysis
+        positions = []
+        if self.session:
+            try:
+                from tastytrade import Account
+                from tastytrade.instruments import Option
+
+                account = Account.get(self.session)[0]
+                raw_positions = account.get_positions(self.session)
+
+                for pos in raw_positions:
+                    if pos.instrument_type == 'Equity Option':
+                        try:
+                            opt = Option.get_option(self.session, pos.symbol)
+                            dte = (opt.expiration_date - date.today()).days
+                            positions.append({
+                                'symbol': pos.symbol,
+                                'underlying': pos.underlying_symbol,
+                                'quantity': pos.quantity,
+                                'pnl_pct': float(pos.multiplier) if hasattr(pos, 'multiplier') else 0,
+                                'dte': dte
+                            })
+                        except Exception:
+                            pass
+            except Exception as e:
+                logger.warning(f"Could not fetch positions for analysis: {e}")
+
+        # Get recent trades
+        recent_trades = [
+            {
+                'symbol': t.underlying_symbol,
+                'strategy': t.strategy.value,
+                'pnl': float(t.expected_credit) if t.status.value == 'executed' else 0
+            }
+            for t in self.trade_history[-10:]
+        ]
+
+        portfolio_state = {
+            'net_liquidating_value': float(self.portfolio_state.net_liquidating_value),
+            'buying_power': float(self.portfolio_state.buying_power),
+            'daily_pnl': float(self.portfolio_state.daily_pnl),
+            'weekly_pnl': float(self.portfolio_state.weekly_pnl),
+            'portfolio_delta': float(self.portfolio_state.portfolio_delta),
+            'portfolio_theta': float(self.portfolio_state.portfolio_theta),
+            'open_positions': self.portfolio_state.open_positions
+        }
+
+        try:
+            analysis = await self.claude_advisor.analyze_portfolio_health(
+                portfolio_state=portfolio_state,
+                positions=positions,
+                recent_trades=recent_trades
+            )
+            return analysis
+        except Exception as e:
+            logger.error(f"Portfolio analysis failed: {e}")
+            return f"Portfolio analysis failed: {e}"
+
     def get_pending_trades(self) -> List[TradeProposal]:
         """Get all trades awaiting approval"""
         return [t for t in self.pending_trades if t.status == TradeStatus.PENDING_APPROVAL]
@@ -1204,6 +1670,23 @@ class TradingBotCLI:
         print("TASTYTRADE TRADING BOT")
         print("Following Tastylive Best Practices")
         print("="*60)
+
+        # Show mode status
+        mode_parts = []
+        if self.bot.sandbox_mode:
+            mode_parts.append("SANDBOX")
+        else:
+            mode_parts.append("PRODUCTION")
+        if self.bot.use_mock_data:
+            mode_parts.append("MOCK DATA")
+        print(f"Mode: {' + '.join(mode_parts)}")
+
+        if self.bot.use_mock_data:
+            print("\nMock Data Info:")
+            print("  - Market data (IV rank, Greeks, quotes) uses simulated values")
+            print("  - Order execution uses real sandbox API")
+            print("  - Configure mock prices in config.json -> mock_data -> symbols")
+
         print("\nCommands:")
         print("  scan <symbols>  - Scan for opportunities (e.g., scan SPY,QQQ,IWM)")
         print("  pending         - Show pending trades")
@@ -1234,9 +1717,16 @@ class TradingBotCLI:
                     
                 elif command == 'scan':
                     symbols = args[0].split(',') if args else ['SPY', 'QQQ', 'IWM']
-                    print(f"Scanning: {symbols}")
+                    data_source = "[MOCK DATA]" if self.bot.use_mock_data else "[LIVE DATA]"
+                    print(f"Scanning {data_source}: {symbols}")
                     opportunities = await self.bot.scan_for_opportunities(symbols)
-                    print(f"Found {len(opportunities)} opportunities")
+                    print(f"\nFound {len(opportunities)} opportunities")
+                    if opportunities:
+                        for opp in opportunities:
+                            print(f"  [{opp.id}] {opp.underlying_symbol} {opp.strategy.value}")
+                            print(f"       IV Rank: {opp.iv_rank}% | Delta: {opp.delta:.2f} | DTE: {opp.dte}")
+                            print(f"       Credit: ${opp.expected_credit:.2f} | Max Loss: ${opp.max_loss:.2f}")
+                        print("\nUse 'pending' to see full details, 'approve <id>' to approve")
                     
                 elif command == 'pending':
                     pending = self.bot.get_pending_trades()
@@ -1360,16 +1850,48 @@ async def main():
 
     Or pass credentials directly to bot.connect()
     """
-    # Create bot with default risk parameters
+    # Load configuration from config.json
+    config = {}
+    config_path = Path(__file__).parent / "config.json"
+    if config_path.exists():
+        try:
+            with open(config_path, 'r') as f:
+                config = json.load(f)
+            logger.info(f"Loaded configuration from {config_path}")
+        except Exception as e:
+            logger.warning(f"Failed to load config.json: {e}")
+
+    # Extract settings from config
+    bot_settings = config.get('bot_settings', {})
+    risk_config = config.get('risk_parameters', {})
+    claude_config = config.get('claude_advisor', {})
+
+    # Build risk parameters from config
+    loss_limits = risk_config.get('loss_limits', {})
+    position_sizing = risk_config.get('position_sizing', {})
+    entry_criteria = config.get('entry_criteria', {})
+    dte_requirements = entry_criteria.get('dte_requirements', {})
+    iv_requirements = entry_criteria.get('iv_requirements', {})
+
+    risk_params = RiskParameters(
+        max_daily_loss=Decimal(str(loss_limits.get('max_daily_loss', 500))),
+        max_weekly_loss=Decimal(str(loss_limits.get('max_weekly_loss', 1500))),
+        max_position_loss=Decimal(str(loss_limits.get('max_position_loss', 300))),
+        max_position_size_percent=Decimal(str(position_sizing.get('max_position_size_percent', 0.05))),
+        max_total_positions=position_sizing.get('max_total_positions', 15),
+        min_iv_rank=Decimal(str(iv_requirements.get('min_iv_rank', 30))),
+        target_dte=dte_requirements.get('target_dte', 45),
+        min_dte=dte_requirements.get('min_dte', 30),
+        max_dte=dte_requirements.get('max_dte', 60),
+    )
+
+    # Create bot with config
+    sandbox_mode = bot_settings.get('sandbox_mode', True)
     bot = TastytradeBot(
-        risk_params=RiskParameters(
-            max_daily_loss=Decimal("500"),
-            max_weekly_loss=Decimal("1500"),
-            max_position_loss=Decimal("300"),
-            min_iv_rank=Decimal("30"),
-            target_dte=45,
-        ),
-        sandbox_mode=True  # Always start in sandbox!
+        risk_params=risk_params,
+        sandbox_mode=sandbox_mode,
+        claude_config=claude_config,
+        config=config  # Pass full config for mock data settings
     )
 
     # Connect using environment variables (recommended)
@@ -1377,12 +1899,19 @@ async def main():
     if os.environ.get('TT_CLIENT_SECRET') and os.environ.get('TT_REFRESH_TOKEN'):
         connected = await bot.connect()
         if connected:
-            print("Connected to Tastytrade API (sandbox mode)")
+            mode_str = "sandbox" if sandbox_mode else "production"
+            mock_str = " with mock data" if bot.use_mock_data else ""
+            print(f"Connected to Tastytrade API ({mode_str} mode{mock_str})")
         else:
             print("Failed to connect - running in offline mode")
+            if bot.use_mock_data:
+                print("Mock data is enabled - you can still scan for opportunities")
     else:
         print("No OAuth credentials found. Set TT_CLIENT_SECRET and TT_REFRESH_TOKEN")
-        print("Running in offline/demo mode - API features will not work")
+        if bot.use_mock_data:
+            print("Mock data is enabled - you can scan for opportunities without API connection")
+        else:
+            print("Running in offline/demo mode - API features will not work")
 
     # Run CLI
     cli = TradingBotCLI(bot)
