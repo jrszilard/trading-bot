@@ -30,7 +30,8 @@ from research import ResearchEngine
 from position_monitor import PositionMonitor, ManagementAlert
 
 # Import trading bot components
-from trading_bot import TastytradeBot, RiskParameters, TradeStatus
+from trading_bot import TastytradeBot
+from models import RiskParameters, TradeStatus, TradeProposal, PortfolioState
 
 logger = logging.getLogger(__name__)
 

@@ -25,10 +25,8 @@ import asyncio
 import json
 import logging
 import os
-from dataclasses import dataclass, field
 from datetime import datetime, timedelta, date
 from decimal import Decimal
-from enum import Enum
 from typing import Optional, List, Callable, Any, Dict
 from pathlib import Path
 
@@ -38,6 +36,22 @@ try:
     load_dotenv()
 except ImportError:
     pass  # python-dotenv not installed, use system env vars
+
+# Import models from separate module
+from models import (
+    TradeStatus,
+    StrategyType,
+    RiskParameters,
+    TradeProposal,
+    PortfolioState,
+    TradeCandidate
+)
+
+# Import risk management functions
+from risk_manager import check_risk_limits, generate_trade_rationale
+
+# Import strategy engine
+from strategy_engine import StrategyEngine
 
 # Import Claude Trade Advisor
 try:
@@ -62,197 +76,6 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
-
-
-class TradeStatus(Enum):
-    """Status of a proposed trade"""
-    PENDING_APPROVAL = "pending_approval"
-    APPROVED = "approved"
-    REJECTED = "rejected"
-    EXECUTED = "executed"
-    FAILED = "failed"
-    CANCELLED = "cancelled"
-
-
-class StrategyType(Enum):
-    """Supported option strategies following tastylive methodology"""
-    SHORT_PUT = "short_put"
-    SHORT_CALL = "short_call"
-    SHORT_STRANGLE = "short_strangle"
-    SHORT_STRADDLE = "short_straddle"
-    IRON_CONDOR = "iron_condor"
-    SHORT_PUT_SPREAD = "short_put_spread"
-    SHORT_CALL_SPREAD = "short_call_spread"
-    COVERED_CALL = "covered_call"
-    CASH_SECURED_PUT = "cash_secured_put"
-
-
-@dataclass
-class RiskParameters:
-    """
-    Risk management parameters following tastylive guidelines
-    
-    Tastylive recommends:
-    - Trade small: 1-5% of portfolio per position
-    - Keep portfolio delta neutral to slightly directional
-    - Maintain buying power reserve
-    """
-    # Maximum loss limits
-    max_daily_loss: Decimal = Decimal("1000.00")  # Maximum daily loss in dollars
-    max_weekly_loss: Decimal = Decimal("3000.00")  # Maximum weekly loss in dollars
-    max_position_loss: Decimal = Decimal("500.00")  # Maximum loss per position
-    max_portfolio_loss_percent: Decimal = Decimal("0.05")  # 5% max portfolio drawdown
-    
-    # Position sizing (tastylive: trade small and often)
-    max_position_size_percent: Decimal = Decimal("0.05")  # 5% of portfolio max per position
-    max_total_positions: int = 20  # Maximum number of open positions
-    max_positions_per_underlying: int = 2  # Max positions per stock/ETF
-    
-    # Buying power management
-    min_buying_power_reserve: Decimal = Decimal("0.30")  # Keep 30% BP in reserve
-    max_buying_power_usage: Decimal = Decimal("0.50")  # Use max 50% of buying power
-    
-    # Portfolio Greeks limits (beta-weighted to SPY)
-    max_portfolio_delta: Decimal = Decimal("500")  # Max beta-weighted delta
-    max_portfolio_theta: Decimal = Decimal("-100")  # Max daily theta decay
-    
-    # IV and probability filters
-    min_iv_rank: Decimal = Decimal("30")  # Minimum IV Rank to enter (tastylive standard)
-    min_probability_otm: Decimal = Decimal("0.65")  # Minimum probability of profit
-    
-    # DTE management (tastylive: 45 DTE entry, 21 DTE management)
-    target_dte: int = 45
-    min_dte: int = 30
-    max_dte: int = 60
-    management_dte: int = 21  # Roll or close at this DTE
-    
-    # Profit/Loss targets (tastylive: 50% profit target)
-    profit_target_percent: Decimal = Decimal("0.50")  # Take profit at 50%
-    stop_loss_multiplier: Decimal = Decimal("2.0")  # Stop at 2x credit received
-
-
-@dataclass
-class TradeProposal:
-    """A proposed trade awaiting approval"""
-    id: str
-    timestamp: datetime
-    strategy: StrategyType
-    underlying_symbol: str
-    legs: List[dict]  # List of option legs
-    expected_credit: Decimal
-    max_loss: Decimal
-    probability_of_profit: Decimal
-    iv_rank: Decimal
-    dte: int
-    delta: Decimal
-    theta: Decimal
-    vega: Decimal
-    rationale: str
-    status: TradeStatus = TradeStatus.PENDING_APPROVAL
-    approved_by: Optional[str] = None
-    approval_timestamp: Optional[datetime] = None
-    rejection_reason: Optional[str] = None
-    execution_result: Optional[dict] = None
-    # Claude AI analysis
-    claude_analysis: Optional[Dict[str, Any]] = None
-    claude_confidence: Optional[int] = None
-
-
-@dataclass
-class PortfolioState:
-    """Current portfolio state for risk calculations"""
-    account_value: Decimal = Decimal("0")
-    buying_power: Decimal = Decimal("0")
-    net_liquidating_value: Decimal = Decimal("0")
-    cash_balance: Decimal = Decimal("0")
-
-    # Current P&L
-    daily_pnl: Decimal = Decimal("0")
-    weekly_pnl: Decimal = Decimal("0")
-
-    # Beta-weighted portfolio Greeks (to SPY)
-    portfolio_delta: Decimal = Decimal("0")
-    portfolio_theta: Decimal = Decimal("0")
-    portfolio_vega: Decimal = Decimal("0")
-    portfolio_gamma: Decimal = Decimal("0")
-
-    # Position counts
-    open_positions: int = 0
-    positions_by_underlying: dict = field(default_factory=dict)
-
-
-@dataclass
-class TradeCandidate:
-    """
-    A candidate trade for multi-strategy evaluation.
-    Used internally during scanning to compare different strategies.
-    """
-    strategy: StrategyType
-    underlying: str
-    legs: List[dict]
-    net_credit: Decimal
-    max_loss: Decimal
-    probability_of_profit: Decimal
-    iv_rank: Decimal
-    dte: int
-    greeks: dict
-    score: Decimal = Decimal("0")  # Kelly-inspired score
-
-    # Strategy-specific details
-    short_strike: Optional[Decimal] = None
-    long_strike: Optional[Decimal] = None
-    spread_width: Optional[Decimal] = None
-    # For iron condors
-    put_short_strike: Optional[Decimal] = None
-    put_long_strike: Optional[Decimal] = None
-    call_short_strike: Optional[Decimal] = None
-    call_long_strike: Optional[Decimal] = None
-
-    def calculate_kelly_score(self) -> Decimal:
-        """
-        Calculate Kelly Criterion inspired score.
-
-        Kelly formula: f* = p - q/b
-        Where:
-        - p = probability of profit
-        - q = probability of loss (1 - p)
-        - b = reward/risk ratio (total_credit/max_loss)
-
-        Note: net_credit is per-share, max_loss is total dollars.
-        We multiply credit by 100 (contract multiplier) for comparison.
-
-        Higher score = better risk-adjusted opportunity
-        """
-        if self.max_loss <= 0 or self.net_credit <= 0:
-            return Decimal("-999")
-
-        p = self.probability_of_profit
-        q = Decimal("1") - p
-
-        # Convert per-share credit to total dollars (1 contract = 100 shares)
-        total_credit = self.net_credit * 100
-        b = total_credit / self.max_loss  # Reward/risk ratio
-
-        # Kelly score: p - (q / b)
-        # Avoid division by zero
-        if b <= 0:
-            return Decimal("-999")
-
-        self.score = p - (q / b)
-        return self.score
-
-    def return_on_risk(self) -> Decimal:
-        """Calculate return on risk percentage (total credit / max loss)."""
-        if self.max_loss <= 0:
-            return Decimal("0")
-        # Convert per-share credit to total dollars
-        total_credit = self.net_credit * 100
-        return (total_credit / self.max_loss) * 100
-
-    def expected_value(self) -> Decimal:
-        """Calculate expected value of the trade."""
-        p = self.probability_of_profit
-        return (p * self.net_credit) - ((1 - p) * self.max_loss)
 
 
 class TastytradeBot:
@@ -331,6 +154,9 @@ class TastytradeBot:
                 self.claude_advisor = None
         elif not CLAUDE_AVAILABLE:
             logger.info("Claude advisor module not available")
+
+        # Initialize Strategy Engine
+        self.strategy_engine = StrategyEngine(self.risk_params)
 
         mock_status = ", mock_data=enabled" if self.use_mock_data else ""
         logger.info(f"TastytradeBot initialized (sandbox_mode={sandbox_mode}{mock_status})")
@@ -639,450 +465,6 @@ class TastytradeBot:
         except Exception as e:
             logger.error(f"Beta-weighted Greeks calculation failed: {e}")
 
-    # =========================================================================
-    # MULTI-STRATEGY EVALUATION SYSTEM
-    # =========================================================================
-
-    def _build_put_spread_candidate(
-        self,
-        symbol: str,
-        puts: List,
-        greeks_by_strike: dict,
-        quotes_by_strike: dict,
-        iv_rank: Decimal,
-        target_exp: date,
-        target_delta: Decimal = Decimal("-0.30")
-    ) -> Optional[TradeCandidate]:
-        """
-        Build a put credit spread candidate for evaluation.
-
-        Args:
-            symbol: Underlying symbol
-            puts: List of put options sorted by strike descending
-            greeks_by_strike: Map of strike -> greeks
-            quotes_by_strike: Map of strike -> (bid, ask) tuple
-            iv_rank: Current IV rank
-            target_exp: Target expiration date
-            target_delta: Target delta for short put (default -0.30)
-
-        Returns:
-            TradeCandidate if valid spread found, None otherwise
-        """
-        # Find the short put at target delta
-        short_put = None
-        short_greeks = None
-        best_delta_diff = Decimal("1.0")
-
-        for opt in puts:
-            strike = opt.strike_price if hasattr(opt, 'strike_price') else Decimal(str(opt.get('strike_price', 0)))
-            if strike not in greeks_by_strike:
-                continue
-            g = greeks_by_strike[strike]
-            delta = Decimal(str(g.delta if hasattr(g, 'delta') else g.get('delta', 0)))
-            delta_diff = abs(delta - target_delta)
-
-            if delta_diff < best_delta_diff:
-                best_delta_diff = delta_diff
-                short_put = opt
-                short_greeks = g
-
-        if short_put is None:
-            return None
-
-        short_strike = short_put.strike_price if hasattr(short_put, 'strike_price') else Decimal(str(short_put.get('strike_price', 0)))
-
-        if short_strike not in quotes_by_strike:
-            return None
-
-        short_bid, short_ask = quotes_by_strike[short_strike]
-        short_credit = (short_bid + short_ask) / 2
-
-        if short_credit <= 0:
-            return None
-
-        # Calculate optimal spread width
-        estimated_net_credit = short_credit * Decimal("0.40")
-        max_width = (self.risk_params.max_position_loss + estimated_net_credit * 100) / 100
-
-        # Get strike interval
-        sorted_strikes = sorted(greeks_by_strike.keys(), reverse=True)
-        if len(sorted_strikes) >= 2:
-            strike_interval = abs(sorted_strikes[0] - sorted_strikes[1])
-        else:
-            strike_interval = Decimal("1.0")
-
-        # Find optimal long put
-        available_strikes = [s for s in sorted_strikes if s < short_strike]
-        if not available_strikes:
-            return None
-
-        long_strike = None
-        long_greeks = None
-        net_credit = Decimal("0")
-        max_loss = Decimal("0")
-        spread_width = Decimal("0")
-
-        for strike in sorted(available_strikes, reverse=True):
-            if strike not in quotes_by_strike:
-                continue
-
-            long_bid, long_ask = quotes_by_strike[strike]
-            long_debit = (long_bid + long_ask) / 2
-
-            width = short_strike - strike
-            test_net_credit = short_credit - long_debit
-            test_max_loss = (width * 100) - (test_net_credit * 100)
-
-            if test_max_loss <= self.risk_params.max_position_loss and test_net_credit > Decimal("0.10"):
-                long_strike = strike
-                long_greeks = greeks_by_strike[strike]
-                spread_width = width
-                net_credit = test_net_credit
-                max_loss = test_max_loss
-                break
-
-        if long_strike is None:
-            return None
-
-        dte = (target_exp - date.today()).days
-        short_delta = Decimal(str(short_greeks.delta if hasattr(short_greeks, 'delta') else short_greeks.get('delta', 0)))
-        prob_otm = Decimal("1") + short_delta
-
-        # Build legs
-        legs = self._create_spread_legs(
-            short_put, long_strike, short_credit, net_credit,
-            target_exp, dte, 'PUT', greeks_by_strike, quotes_by_strike,
-            options=puts
-        )
-
-        # Net greeks
-        long_delta = Decimal(str(long_greeks.delta if hasattr(long_greeks, 'delta') else long_greeks.get('delta', 0)))
-        long_theta = Decimal(str(long_greeks.theta if hasattr(long_greeks, 'theta') else long_greeks.get('theta', 0)))
-        long_vega = Decimal(str(long_greeks.vega if hasattr(long_greeks, 'vega') else long_greeks.get('vega', 0)))
-        long_gamma = Decimal(str(long_greeks.gamma if hasattr(long_greeks, 'gamma') else long_greeks.get('gamma', 0)))
-        short_theta = Decimal(str(short_greeks.theta if hasattr(short_greeks, 'theta') else short_greeks.get('theta', 0)))
-        short_vega = Decimal(str(short_greeks.vega if hasattr(short_greeks, 'vega') else short_greeks.get('vega', 0)))
-        short_gamma = Decimal(str(short_greeks.gamma if hasattr(short_greeks, 'gamma') else short_greeks.get('gamma', 0)))
-
-        greeks = {
-            'delta': float(short_delta + long_delta),
-            'theta': float(short_theta + long_theta),
-            'vega': float(short_vega + long_vega),
-            'gamma': float(short_gamma + long_gamma),
-            'pop': float(prob_otm)
-        }
-
-        candidate = TradeCandidate(
-            strategy=StrategyType.SHORT_PUT_SPREAD,
-            underlying=symbol,
-            legs=legs,
-            net_credit=net_credit,
-            max_loss=max_loss,
-            probability_of_profit=prob_otm,
-            iv_rank=iv_rank,
-            dte=dte,
-            greeks=greeks,
-            short_strike=short_strike,
-            long_strike=long_strike,
-            spread_width=spread_width
-        )
-        candidate.calculate_kelly_score()
-
-        return candidate
-
-    def _build_call_spread_candidate(
-        self,
-        symbol: str,
-        calls: List,
-        greeks_by_strike: dict,
-        quotes_by_strike: dict,
-        iv_rank: Decimal,
-        target_exp: date,
-        target_delta: Decimal = Decimal("0.30")
-    ) -> Optional[TradeCandidate]:
-        """
-        Build a call credit spread candidate for evaluation.
-
-        Args:
-            symbol: Underlying symbol
-            calls: List of call options sorted by strike ascending
-            greeks_by_strike: Map of strike -> greeks
-            quotes_by_strike: Map of strike -> (bid, ask) tuple
-            iv_rank: Current IV rank
-            target_exp: Target expiration date
-            target_delta: Target delta for short call (default 0.30)
-
-        Returns:
-            TradeCandidate if valid spread found, None otherwise
-        """
-        # Find the short call at target delta
-        short_call = None
-        short_greeks = None
-        best_delta_diff = Decimal("1.0")
-
-        for opt in calls:
-            strike = opt.strike_price if hasattr(opt, 'strike_price') else Decimal(str(opt.get('strike_price', 0)))
-            if strike not in greeks_by_strike:
-                continue
-            g = greeks_by_strike[strike]
-            delta = Decimal(str(g.delta if hasattr(g, 'delta') else g.get('delta', 0)))
-            delta_diff = abs(delta - target_delta)
-
-            if delta_diff < best_delta_diff:
-                best_delta_diff = delta_diff
-                short_call = opt
-                short_greeks = g
-
-        if short_call is None:
-            return None
-
-        short_strike = short_call.strike_price if hasattr(short_call, 'strike_price') else Decimal(str(short_call.get('strike_price', 0)))
-
-        if short_strike not in quotes_by_strike:
-            return None
-
-        short_bid, short_ask = quotes_by_strike[short_strike]
-        short_credit = (short_bid + short_ask) / 2
-
-        if short_credit <= 0:
-            return None
-
-        # Calculate optimal spread width
-        estimated_net_credit = short_credit * Decimal("0.40")
-        max_width = (self.risk_params.max_position_loss + estimated_net_credit * 100) / 100
-
-        # Get strike interval
-        sorted_strikes = sorted(greeks_by_strike.keys())
-        if len(sorted_strikes) >= 2:
-            strike_interval = abs(sorted_strikes[1] - sorted_strikes[0])
-        else:
-            strike_interval = Decimal("1.0")
-
-        # Find optimal long call (higher strike for call spread)
-        available_strikes = [s for s in sorted_strikes if s > short_strike]
-        if not available_strikes:
-            return None
-
-        long_strike = None
-        long_greeks = None
-        net_credit = Decimal("0")
-        max_loss = Decimal("0")
-        spread_width = Decimal("0")
-
-        for strike in sorted(available_strikes):  # Ascending for calls
-            if strike not in quotes_by_strike:
-                continue
-
-            long_bid, long_ask = quotes_by_strike[strike]
-            long_debit = (long_bid + long_ask) / 2
-
-            width = strike - short_strike
-            test_net_credit = short_credit - long_debit
-            test_max_loss = (width * 100) - (test_net_credit * 100)
-
-            if test_max_loss <= self.risk_params.max_position_loss and test_net_credit > Decimal("0.10"):
-                long_strike = strike
-                long_greeks = greeks_by_strike[strike]
-                spread_width = width
-                net_credit = test_net_credit
-                max_loss = test_max_loss
-                break
-
-        if long_strike is None:
-            return None
-
-        dte = (target_exp - date.today()).days
-        short_delta = Decimal(str(short_greeks.delta if hasattr(short_greeks, 'delta') else short_greeks.get('delta', 0)))
-        # For calls, prob OTM = 1 - delta
-        prob_otm = Decimal("1") - short_delta
-
-        # Build legs
-        legs = self._create_spread_legs(
-            short_call, long_strike, short_credit, net_credit,
-            target_exp, dte, 'CALL', greeks_by_strike, quotes_by_strike,
-            options=calls
-        )
-
-        # Net greeks
-        long_delta = Decimal(str(long_greeks.delta if hasattr(long_greeks, 'delta') else long_greeks.get('delta', 0)))
-        long_theta = Decimal(str(long_greeks.theta if hasattr(long_greeks, 'theta') else long_greeks.get('theta', 0)))
-        long_vega = Decimal(str(long_greeks.vega if hasattr(long_greeks, 'vega') else long_greeks.get('vega', 0)))
-        long_gamma = Decimal(str(long_greeks.gamma if hasattr(long_greeks, 'gamma') else long_greeks.get('gamma', 0)))
-        short_theta = Decimal(str(short_greeks.theta if hasattr(short_greeks, 'theta') else short_greeks.get('theta', 0)))
-        short_vega = Decimal(str(short_greeks.vega if hasattr(short_greeks, 'vega') else short_greeks.get('vega', 0)))
-        short_gamma = Decimal(str(short_greeks.gamma if hasattr(short_greeks, 'gamma') else short_greeks.get('gamma', 0)))
-
-        greeks = {
-            'delta': float(short_delta + long_delta),
-            'theta': float(short_theta + long_theta),
-            'vega': float(short_vega + long_vega),
-            'gamma': float(short_gamma + long_gamma),
-            'pop': float(prob_otm)
-        }
-
-        candidate = TradeCandidate(
-            strategy=StrategyType.SHORT_CALL_SPREAD,
-            underlying=symbol,
-            legs=legs,
-            net_credit=net_credit,
-            max_loss=max_loss,
-            probability_of_profit=prob_otm,
-            iv_rank=iv_rank,
-            dte=dte,
-            greeks=greeks,
-            short_strike=short_strike,
-            long_strike=long_strike,
-            spread_width=spread_width
-        )
-        candidate.calculate_kelly_score()
-
-        return candidate
-
-    def _build_iron_condor_candidate(
-        self,
-        symbol: str,
-        puts: List,
-        calls: List,
-        put_greeks: dict,
-        call_greeks: dict,
-        put_quotes: dict,
-        call_quotes: dict,
-        iv_rank: Decimal,
-        target_exp: date,
-        put_delta: Decimal = Decimal("-0.16"),
-        call_delta: Decimal = Decimal("0.16")
-    ) -> Optional[TradeCandidate]:
-        """
-        Build an iron condor candidate for evaluation.
-
-        Iron condor = put spread + call spread (neutral strategy)
-        Uses 16 delta for wider wings (tastylive standard for IC)
-
-        Returns:
-            TradeCandidate if valid iron condor found, None otherwise
-        """
-        # Build put spread side
-        put_candidate = self._build_put_spread_candidate(
-            symbol, puts, put_greeks, put_quotes, iv_rank, target_exp,
-            target_delta=put_delta
-        )
-
-        # Build call spread side
-        call_candidate = self._build_call_spread_candidate(
-            symbol, calls, call_greeks, call_quotes, iv_rank, target_exp,
-            target_delta=call_delta
-        )
-
-        if put_candidate is None or call_candidate is None:
-            return None
-
-        # Combine into iron condor
-        # Check combined max loss fits within limit
-        # For iron condor, max loss is the wider spread width (since you can only lose on one side)
-        combined_max_loss = max(put_candidate.max_loss, call_candidate.max_loss)
-        combined_credit = put_candidate.net_credit + call_candidate.net_credit
-
-        if combined_max_loss > self.risk_params.max_position_loss:
-            return None
-
-        # Combined probability: product of both sides being OTM
-        combined_prob = put_candidate.probability_of_profit * call_candidate.probability_of_profit
-
-        dte = put_candidate.dte
-
-        # Combine legs
-        legs = put_candidate.legs + call_candidate.legs
-
-        # Combined greeks (mostly cancel out for neutral strategy)
-        greeks = {
-            'delta': put_candidate.greeks['delta'] + call_candidate.greeks['delta'],
-            'theta': put_candidate.greeks['theta'] + call_candidate.greeks['theta'],
-            'vega': put_candidate.greeks['vega'] + call_candidate.greeks['vega'],
-            'gamma': put_candidate.greeks['gamma'] + call_candidate.greeks['gamma'],
-            'pop': float(combined_prob)
-        }
-
-        candidate = TradeCandidate(
-            strategy=StrategyType.IRON_CONDOR,
-            underlying=symbol,
-            legs=legs,
-            net_credit=combined_credit,
-            max_loss=combined_max_loss,
-            probability_of_profit=combined_prob,
-            iv_rank=iv_rank,
-            dte=dte,
-            greeks=greeks,
-            put_short_strike=put_candidate.short_strike,
-            put_long_strike=put_candidate.long_strike,
-            call_short_strike=call_candidate.short_strike,
-            call_long_strike=call_candidate.long_strike
-        )
-        candidate.calculate_kelly_score()
-
-        return candidate
-
-    def _create_spread_legs(
-        self,
-        short_option,
-        long_strike: Decimal,
-        short_credit: Decimal,
-        net_credit: Decimal,
-        target_exp: date,
-        dte: int,
-        option_type: str,
-        greeks_by_strike: dict,
-        quotes_by_strike: dict,
-        options: List = None
-    ) -> List[dict]:
-        """Helper to create legs for a vertical spread."""
-        short_strike = short_option.strike_price if hasattr(short_option, 'strike_price') else Decimal(str(short_option.get('strike_price', 0)))
-
-        # Get option symbols
-        short_symbol = short_option.symbol if hasattr(short_option, 'symbol') else short_option.get('symbol', '')
-        short_streamer = short_option.streamer_symbol if hasattr(short_option, 'streamer_symbol') else short_option.get('streamer_symbol', '')
-
-        # Find the long option to get its symbol
-        long_symbol = ''
-        long_streamer = ''
-        if options:
-            for opt in options:
-                opt_strike = opt.strike_price if hasattr(opt, 'strike_price') else Decimal(str(opt.get('strike_price', 0)))
-                opt_type = opt.option_type if hasattr(opt, 'option_type') else opt.get('option_type', '')
-                if opt_strike == long_strike and opt_type == option_type[0]:  # 'P' or 'C'
-                    long_symbol = opt.symbol if hasattr(opt, 'symbol') else opt.get('symbol', '')
-                    long_streamer = opt.streamer_symbol if hasattr(opt, 'streamer_symbol') else opt.get('streamer_symbol', '')
-                    break
-
-        # Calculate long debit
-        long_debit = short_credit - net_credit
-
-        legs = [
-            {
-                'symbol': short_symbol,
-                'streamer_symbol': short_streamer,
-                'option_type': option_type,
-                'strike': str(short_strike),
-                'expiration': str(target_exp),
-                'action': 'SELL_TO_OPEN',
-                'quantity': 1,
-                'credit': str(short_credit),
-                'dte': dte
-            },
-            {
-                'symbol': long_symbol,
-                'streamer_symbol': long_streamer,
-                'option_type': option_type,
-                'strike': str(long_strike),
-                'expiration': str(target_exp),
-                'action': 'BUY_TO_OPEN',
-                'quantity': 1,
-                'debit': str(long_debit),
-                'dte': dte
-            }
-        ]
-
-        return legs
-
     def _evaluate_strategies_for_symbol(
         self,
         symbol: str,
@@ -1094,201 +476,38 @@ class TastytradeBot:
         max_candidates: int = 3
     ) -> List[TradeCandidate]:
         """
-        Evaluate all defined-risk strategies for a symbol and return top candidates.
-
-        Args:
-            symbol: Underlying symbol
-            options: All options for the symbol at target expiration
-            greeks_by_strike: Combined greeks map (puts and calls)
-            quotes_by_strike: Combined quotes map (puts and calls)
-            iv_rank: Current IV rank
-            target_exp: Target expiration
-            max_candidates: Maximum candidates to return (default 3)
-
-        Returns:
-            List of top TradeCandidate objects sorted by Kelly score
+        Evaluate all strategies for a symbol using the strategy engine.
+        Delegates to StrategyEngine for actual evaluation.
         """
-        candidates = []
-
-        # Separate puts and calls
-        puts = sorted(
-            [opt for opt in options if (opt.option_type if hasattr(opt, 'option_type') else opt.get('option_type')) == 'P'],
-            key=lambda x: x.strike_price if hasattr(x, 'strike_price') else Decimal(str(x.get('strike_price', 0))),
-            reverse=True
+        return self.strategy_engine.evaluate_strategies_for_symbol(
+            symbol=symbol,
+            options=options,
+            greeks_by_strike=greeks_by_strike,
+            quotes_by_strike=quotes_by_strike,
+            iv_rank=iv_rank,
+            target_exp=target_exp,
+            max_candidates=max_candidates
         )
-        calls = sorted(
-            [opt for opt in options if (opt.option_type if hasattr(opt, 'option_type') else opt.get('option_type')) == 'C'],
-            key=lambda x: x.strike_price if hasattr(x, 'strike_price') else Decimal(str(x.get('strike_price', 0)))
-        )
-
-        # Separate greeks and quotes by type
-        # Handle both old format (strike only) and new format ((strike, opt_type) tuple)
-        put_greeks = {}
-        call_greeks = {}
-        put_quotes = {}
-        call_quotes = {}
-
-        for key, val in greeks_by_strike.items():
-            if isinstance(key, tuple):
-                # New format: (strike, option_type)
-                strike, opt_type = key
-                if opt_type == 'P':
-                    put_greeks[strike] = val
-                else:
-                    call_greeks[strike] = val
-            else:
-                # Old format: just strike - add to both (legacy compatibility)
-                put_greeks[key] = val
-                call_greeks[key] = val
-
-        for key, val in quotes_by_strike.items():
-            if isinstance(key, tuple):
-                strike, opt_type = key
-                if opt_type == 'P':
-                    put_quotes[strike] = val
-                else:
-                    call_quotes[strike] = val
-            else:
-                put_quotes[key] = val
-                call_quotes[key] = val
-
-        # Strategy 1: Put Credit Spread (30 delta - bullish)
-        put_spread = self._build_put_spread_candidate(
-            symbol, puts, put_greeks, put_quotes, iv_rank, target_exp,
-            target_delta=Decimal("-0.30")
-        )
-        if put_spread:
-            candidates.append(put_spread)
-            logger.debug(f"{symbol} PUT SPREAD: {put_spread.short_strike}P/{put_spread.long_strike}P "
-                        f"Score={put_spread.score:.3f}, Credit=${put_spread.net_credit:.2f}")
-
-        # Strategy 2: Call Credit Spread (30 delta - bearish)
-        call_spread = self._build_call_spread_candidate(
-            symbol, calls, call_greeks, call_quotes, iv_rank, target_exp,
-            target_delta=Decimal("0.30")
-        )
-        if call_spread:
-            candidates.append(call_spread)
-            logger.debug(f"{symbol} CALL SPREAD: {call_spread.short_strike}C/{call_spread.long_strike}C "
-                        f"Score={call_spread.score:.3f}, Credit=${call_spread.net_credit:.2f}")
-
-        # Strategy 3: Iron Condor (16 delta wings - neutral)
-        iron_condor = self._build_iron_condor_candidate(
-            symbol, puts, calls, put_greeks, call_greeks, put_quotes, call_quotes,
-            iv_rank, target_exp
-        )
-        if iron_condor:
-            candidates.append(iron_condor)
-            logger.debug(f"{symbol} IRON CONDOR: {iron_condor.put_short_strike}P/{iron_condor.put_long_strike}P "
-                        f"+ {iron_condor.call_short_strike}C/{iron_condor.call_long_strike}C "
-                        f"Score={iron_condor.score:.3f}, Credit=${iron_condor.net_credit:.2f}")
-
-        # Sort by Kelly score (descending) and return top N
-        candidates.sort(key=lambda x: x.score, reverse=True)
-
-        if candidates:
-            logger.info(f"{symbol}: Evaluated {len(candidates)} strategies, "
-                       f"best={candidates[0].strategy.value} (score={candidates[0].score:.3f})")
-
-        return candidates[:max_candidates]
 
     def check_risk_limits(self, proposal: TradeProposal) -> tuple[bool, str]:
         """
-        Check if a proposed trade passes all risk limits
-        
-        Returns:
-            (passed, reason) - Boolean and explanation
+        Check if a proposed trade passes all risk limits.
+        Delegates to risk_manager module.
         """
-        params = self.risk_params
-        state = self.portfolio_state
-        
-        # Check daily loss limit
-        if state.daily_pnl <= -params.max_daily_loss:
-            return False, f"Daily loss limit reached (${params.max_daily_loss})"
-        
-        # Check weekly loss limit
-        if state.weekly_pnl <= -params.max_weekly_loss:
-            return False, f"Weekly loss limit reached (${params.max_weekly_loss})"
-        
-        # Check position max loss
-        if proposal.max_loss > params.max_position_loss:
-            return False, f"Position max loss ${proposal.max_loss} exceeds limit ${params.max_position_loss}"
-        
-        # Check position size as percent of portfolio
-        if state.net_liquidating_value > 0:
-            position_percent = proposal.max_loss / state.net_liquidating_value
-            if position_percent > params.max_position_size_percent:
-                return False, f"Position size {position_percent:.1%} exceeds max {params.max_position_size_percent:.1%}"
-        
-        # Check total positions limit
-        if state.open_positions >= params.max_total_positions:
-            return False, f"Maximum positions ({params.max_total_positions}) reached"
-        
-        # Check positions per underlying
-        underlying_count = state.positions_by_underlying.get(proposal.underlying_symbol, 0)
-        if underlying_count >= params.max_positions_per_underlying:
-            return False, f"Max positions for {proposal.underlying_symbol} reached ({params.max_positions_per_underlying})"
-        
-        # Check buying power usage
-        if state.buying_power > 0:
-            bp_usage = (state.buying_power - proposal.max_loss) / state.buying_power
-            if bp_usage < params.min_buying_power_reserve:
-                return False, f"Insufficient buying power reserve (need {params.min_buying_power_reserve:.0%})"
-        elif state.buying_power <= 0:
-            if self.sandbox_mode and state.net_liquidating_value > 0:
-                # Sandbox with 0 BP but positive NLV - skip check (uninitialized sandbox account)
-                logger.debug("Sandbox mode: skipping BP reserve check (BP=0, NLV>0)")
-            else:
-                # Production mode or no NLV - reject trade
-                return False, "Insufficient buying power (BP=0)"
-        
-        # Check IV Rank (tastylive: enter when IV is elevated)
-        if proposal.iv_rank < params.min_iv_rank:
-            return False, f"IV Rank {proposal.iv_rank} below minimum {params.min_iv_rank}"
-        
-        # Check probability of profit
-        if proposal.probability_of_profit < params.min_probability_otm:
-            return False, f"Probability {proposal.probability_of_profit:.0%} below minimum {params.min_probability_otm:.0%}"
-        
-        # Check DTE range (tastylive: ~45 DTE)
-        if not (params.min_dte <= proposal.dte <= params.max_dte):
-            return False, f"DTE {proposal.dte} outside range {params.min_dte}-{params.max_dte}"
-        
-        # Check portfolio delta impact
-        new_delta = state.portfolio_delta + proposal.delta
-        if abs(new_delta) > params.max_portfolio_delta:
-            return False, f"Would exceed portfolio delta limit ({params.max_portfolio_delta})"
-        
-        return True, "All risk checks passed"
-    
+        return check_risk_limits(
+            proposal=proposal,
+            risk_params=self.risk_params,
+            portfolio_state=self.portfolio_state,
+            sandbox_mode=self.sandbox_mode
+        )
+
     def generate_trade_rationale(self, proposal: TradeProposal) -> str:
         """
-        Generate human-readable rationale for the trade
-        following tastylive methodology
+        Generate human-readable rationale for the trade.
+        Delegates to risk_manager module.
         """
-        rationale_parts = [
-            f"Strategy: {proposal.strategy.value}",
-            f"Underlying: {proposal.underlying_symbol}",
-            f"",
-            "Tastylive Criteria Met:",
-            f"  ✓ IV Rank: {proposal.iv_rank}% (target: >{self.risk_params.min_iv_rank}%)",
-            f"  ✓ DTE: {proposal.dte} days (target: ~{self.risk_params.target_dte})",
-            f"  ✓ Probability OTM: {proposal.probability_of_profit:.1%} (target: >{self.risk_params.min_probability_otm:.0%})",
-            f"",
-            "Trade Details:",
-            f"  Expected Credit: ${proposal.expected_credit}",
-            f"  Max Loss: ${proposal.max_loss}",
-            f"  Delta: {proposal.delta}",
-            f"  Theta: {proposal.theta} (daily decay)",
-            f"",
-            "Management Plan:",
-            f"  • Take profit at 50% (${proposal.expected_credit * Decimal('0.5'):.2f})",
-            f"  • Roll or close at {self.risk_params.management_dte} DTE",
-            f"  • Stop loss at 2x credit (${proposal.expected_credit * Decimal('2'):.2f} debit)",
-        ]
-        
-        return "\n".join(rationale_parts)
-    
+        return generate_trade_rationale(proposal, self.risk_params)
+
     async def propose_trade(
         self,
         strategy: StrategyType,

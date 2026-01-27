@@ -54,7 +54,8 @@ async def test_nl_request(user_message: str, skip_claude_filter: bool = False):
             config = json.load(f)
 
     # Build risk parameters
-    from trading_bot import TastytradeBot, RiskParameters
+    from trading_bot import TastytradeBot
+    from models import RiskParameters
 
     risk_config = config.get('risk_parameters', {})
     loss_limits = risk_config.get('loss_limits', {})
@@ -194,7 +195,8 @@ async def test_direct_scan(symbol: str):
     # Disable Claude for this test to see raw opportunities
     config['claude_advisor'] = {'enabled': False}
 
-    from trading_bot import TastytradeBot, RiskParameters
+    from trading_bot import TastytradeBot
+    from models import RiskParameters
 
     risk_config = config.get('risk_parameters', {})
     loss_limits = risk_config.get('loss_limits', {})

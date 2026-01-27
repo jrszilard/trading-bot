@@ -93,7 +93,8 @@ async def run_comprehensive_test(user_message: str):
     with open(config_path) as f:
         config = json.load(f)
 
-    from trading_bot import TastytradeBot, RiskParameters
+    from trading_bot import TastytradeBot
+    from models import RiskParameters
 
     risk_config = config.get('risk_parameters', {})
     loss_limits = risk_config.get('loss_limits', {})
