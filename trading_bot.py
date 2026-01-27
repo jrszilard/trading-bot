@@ -552,6 +552,18 @@ class TastytradeBot:
                 max_loss = (spread_width * 100) - (expected_credit * 100)
             else:
                 max_loss = Decimal("0")
+        elif strategy == StrategyType.IRON_CONDOR:
+            # Calculate max loss for iron condor: max(put_spread_width, call_spread_width) * 100 - net_credit * 100
+            # Separate legs by option type
+            put_strikes = [Decimal(str(leg.get('strike', 0))) for leg in legs if leg.get('option_type') == 'PUT']
+            call_strikes = [Decimal(str(leg.get('strike', 0))) for leg in legs if leg.get('option_type') == 'CALL']
+
+            put_width = abs(max(put_strikes) - min(put_strikes)) if len(put_strikes) >= 2 else Decimal("0")
+            call_width = abs(max(call_strikes) - min(call_strikes)) if len(call_strikes) >= 2 else Decimal("0")
+
+            # Max loss is the wider spread width minus total credit received
+            wider_spread = max(put_width, call_width)
+            max_loss = (wider_spread * 100) - (expected_credit * 100)
         else:
             max_loss = Decimal("0")
 
