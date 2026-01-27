@@ -449,12 +449,24 @@ class TastytradeBot:
             
             account = accounts[0]
             
-            # Get balances
-            balances = account.get_balances(self.session)
-            self.portfolio_state.account_value = Decimal(str(balances.equity_value or 0))
-            self.portfolio_state.buying_power = Decimal(str(balances.derivative_buying_power or 0))
-            self.portfolio_state.net_liquidating_value = Decimal(str(balances.net_liquidating_value or 0))
-            self.portfolio_state.cash_balance = Decimal(str(balances.cash_balance or 0))
+            # Get balances (with fallback for uninitialized sandbox accounts)
+            try:
+                balances = account.get_balances(self.session)
+                self.portfolio_state.account_value = Decimal(str(balances.margin_equity or 0))
+                self.portfolio_state.buying_power = Decimal(str(balances.derivative_buying_power or 0))
+                self.portfolio_state.net_liquidating_value = Decimal(str(balances.net_liquidating_value or 0))
+                self.portfolio_state.cash_balance = Decimal(str(balances.cash_balance or 0))
+            except Exception as balance_error:
+                if "record_not_found" in str(balance_error) or "404" in str(balance_error):
+                    logger.warning("Sandbox account has no balances - using mock values. "
+                                   "Initialize your account at https://cert.tastytrade.com")
+                    # Use mock balances for sandbox testing
+                    self.portfolio_state.account_value = Decimal("100000.00")
+                    self.portfolio_state.buying_power = Decimal("50000.00")
+                    self.portfolio_state.net_liquidating_value = Decimal("100000.00")
+                    self.portfolio_state.cash_balance = Decimal("100000.00")
+                else:
+                    raise
             
             # Get positions and calculate Greeks
             positions = account.get_positions(self.session)
@@ -739,7 +751,8 @@ class TastytradeBot:
         # Build legs
         legs = self._create_spread_legs(
             short_put, long_strike, short_credit, net_credit,
-            target_exp, dte, 'PUT', greeks_by_strike, quotes_by_strike
+            target_exp, dte, 'PUT', greeks_by_strike, quotes_by_strike,
+            options=puts
         )
 
         # Net greeks
@@ -886,7 +899,8 @@ class TastytradeBot:
         # Build legs
         legs = self._create_spread_legs(
             short_call, long_strike, short_credit, net_credit,
-            target_exp, dte, 'CALL', greeks_by_strike, quotes_by_strike
+            target_exp, dte, 'CALL', greeks_by_strike, quotes_by_strike,
+            options=calls
         )
 
         # Net greeks
@@ -1017,7 +1031,8 @@ class TastytradeBot:
         dte: int,
         option_type: str,
         greeks_by_strike: dict,
-        quotes_by_strike: dict
+        quotes_by_strike: dict,
+        options: List = None
     ) -> List[dict]:
         """Helper to create legs for a vertical spread."""
         short_strike = short_option.strike_price if hasattr(short_option, 'strike_price') else Decimal(str(short_option.get('strike_price', 0)))
@@ -1025,6 +1040,18 @@ class TastytradeBot:
         # Get option symbols
         short_symbol = short_option.symbol if hasattr(short_option, 'symbol') else short_option.get('symbol', '')
         short_streamer = short_option.streamer_symbol if hasattr(short_option, 'streamer_symbol') else short_option.get('streamer_symbol', '')
+
+        # Find the long option to get its symbol
+        long_symbol = ''
+        long_streamer = ''
+        if options:
+            for opt in options:
+                opt_strike = opt.strike_price if hasattr(opt, 'strike_price') else Decimal(str(opt.get('strike_price', 0)))
+                opt_type = opt.option_type if hasattr(opt, 'option_type') else opt.get('option_type', '')
+                if opt_strike == long_strike and opt_type == option_type[0]:  # 'P' or 'C'
+                    long_symbol = opt.symbol if hasattr(opt, 'symbol') else opt.get('symbol', '')
+                    long_streamer = opt.streamer_symbol if hasattr(opt, 'streamer_symbol') else opt.get('streamer_symbol', '')
+                    break
 
         # Calculate long debit
         long_debit = short_credit - net_credit
@@ -1042,6 +1069,8 @@ class TastytradeBot:
                 'dte': dte
             },
             {
+                'symbol': long_symbol,
+                'streamer_symbol': long_streamer,
                 'option_type': option_type,
                 'strike': str(long_strike),
                 'expiration': str(target_exp),
@@ -1093,13 +1122,35 @@ class TastytradeBot:
         )
 
         # Separate greeks and quotes by type
-        put_strikes = {opt.strike_price if hasattr(opt, 'strike_price') else Decimal(str(opt.get('strike_price', 0))) for opt in puts}
-        call_strikes = {opt.strike_price if hasattr(opt, 'strike_price') else Decimal(str(opt.get('strike_price', 0))) for opt in calls}
+        # Handle both old format (strike only) and new format ((strike, opt_type) tuple)
+        put_greeks = {}
+        call_greeks = {}
+        put_quotes = {}
+        call_quotes = {}
 
-        put_greeks = {k: v for k, v in greeks_by_strike.items() if k in put_strikes}
-        call_greeks = {k: v for k, v in greeks_by_strike.items() if k in call_strikes}
-        put_quotes = {k: v for k, v in quotes_by_strike.items() if k in put_strikes}
-        call_quotes = {k: v for k, v in quotes_by_strike.items() if k in call_strikes}
+        for key, val in greeks_by_strike.items():
+            if isinstance(key, tuple):
+                # New format: (strike, option_type)
+                strike, opt_type = key
+                if opt_type == 'P':
+                    put_greeks[strike] = val
+                else:
+                    call_greeks[strike] = val
+            else:
+                # Old format: just strike - add to both (legacy compatibility)
+                put_greeks[key] = val
+                call_greeks[key] = val
+
+        for key, val in quotes_by_strike.items():
+            if isinstance(key, tuple):
+                strike, opt_type = key
+                if opt_type == 'P':
+                    put_quotes[strike] = val
+                else:
+                    call_quotes[strike] = val
+            else:
+                put_quotes[key] = val
+                call_quotes[key] = val
 
         # Strategy 1: Put Credit Spread (30 delta - bullish)
         put_spread = self._build_put_spread_candidate(
@@ -1179,9 +1230,17 @@ class TastytradeBot:
             return False, f"Max positions for {proposal.underlying_symbol} reached ({params.max_positions_per_underlying})"
         
         # Check buying power usage
-        bp_usage = (state.buying_power - proposal.max_loss) / state.buying_power if state.buying_power > 0 else 0
-        if bp_usage < params.min_buying_power_reserve:
-            return False, f"Insufficient buying power reserve (need {params.min_buying_power_reserve:.0%})"
+        if state.buying_power > 0:
+            bp_usage = (state.buying_power - proposal.max_loss) / state.buying_power
+            if bp_usage < params.min_buying_power_reserve:
+                return False, f"Insufficient buying power reserve (need {params.min_buying_power_reserve:.0%})"
+        elif state.buying_power <= 0:
+            if self.sandbox_mode and state.net_liquidating_value > 0:
+                # Sandbox with 0 BP but positive NLV - skip check (uninitialized sandbox account)
+                logger.debug("Sandbox mode: skipping BP reserve check (BP=0, NLV>0)")
+            else:
+                # Production mode or no NLV - reject trade
+                return False, "Insufficient buying power (BP=0)"
         
         # Check IV Rank (tastylive: enter when IV is elevated)
         if proposal.iv_rank < params.min_iv_rank:
@@ -1447,12 +1506,33 @@ class TastytradeBot:
             proposal.execution_result = {"error": "Session refresh failed"}
             return False
 
+        # Handle mock data execution (sandbox with synthetic options)
+        if self.use_mock_data and self.sandbox_mode:
+            logger.info(f"[MOCK EXECUTION] Simulating trade {proposal.id} - {proposal.underlying_symbol} {proposal.strategy.value}")
+            logger.info(f"  Credit: ${proposal.expected_credit:.2f} | Max Loss: ${proposal.max_loss:.2f}")
+            for leg in proposal.legs:
+                logger.info(f"  Leg: {leg.get('action')} {leg.get('quantity', 1)}x {leg.get('symbol')}")
+
+            proposal.status = TradeStatus.EXECUTED
+            proposal.execution_result = {
+                "mock_execution": True,
+                "sandbox": True,
+                "message": "Trade simulated with mock data (market closed or using synthetic options)"
+            }
+
+            # Move to history
+            if proposal in self.pending_trades:
+                self.pending_trades.remove(proposal)
+            self.trade_history.append(proposal)
+
+            return True
+
         try:
             from tastytrade import Account
             from tastytrade.order import NewOrder, OrderAction, OrderTimeInForce, OrderType
-            
+
             account = Account.get(self.session)[0]
-            
+
             # Build order legs
             order_legs = []
             for leg in proposal.legs:
@@ -2217,6 +2297,9 @@ class TastytradeBot:
             logger.error("Mock provider not available")
             return opportunities
 
+        # Update portfolio state for risk checks
+        await self.update_portfolio_state()
+
         logger.info(f"Scanning with MOCK DATA (multi-strategy): {symbols}")
 
         # Get mock metrics for all symbols
@@ -2248,18 +2331,21 @@ class TastytradeBot:
                 options = chain[target_exp]
 
                 # Build greeks and quotes maps for all options
+                # Key by (strike, option_type) to keep puts and calls separate
                 greeks_by_strike = {}
                 quotes_by_strike = {}
 
                 for opt in options:
                     strike = opt.strike_price
-                    greeks_by_strike[strike] = self.mock_provider.get_greeks(opt)
+                    opt_type = opt.option_type
+                    key = (strike, opt_type)
+                    greeks_by_strike[key] = self.mock_provider.get_greeks(opt)
                     quote = self.mock_provider.get_quote(
                         symbol=opt.symbol,
                         is_option=True,
                         option=opt
                     )
-                    quotes_by_strike[strike] = (
+                    quotes_by_strike[key] = (
                         Decimal(str(quote.bid_price)),
                         Decimal(str(quote.ask_price))
                     )
