@@ -335,23 +335,29 @@ class MockDataProvider:
     """
 
     # Default mock data for common symbols
+    # IV ranks set to pass default filter (min_iv_rank = 30)
     DEFAULT_SYMBOLS = {
         'SPY': {'price': 480.0, 'iv_rank': 35, 'beta': 1.0, 'option_strike_interval': 1.0},
         'QQQ': {'price': 410.0, 'iv_rank': 42, 'beta': 1.2, 'option_strike_interval': 1.0},
         'IWM': {'price': 200.0, 'iv_rank': 38, 'beta': 1.3, 'option_strike_interval': 1.0},
         'DIA': {'price': 380.0, 'iv_rank': 32, 'beta': 0.9, 'option_strike_interval': 1.0},
-        'AAPL': {'price': 185.0, 'iv_rank': 28, 'beta': 1.1, 'option_strike_interval': 2.5},
-        'MSFT': {'price': 420.0, 'iv_rank': 30, 'beta': 1.0, 'option_strike_interval': 2.5},
+        'AAPL': {'price': 185.0, 'iv_rank': 33, 'beta': 1.1, 'option_strike_interval': 2.5},  # Increased from 28
+        'MSFT': {'price': 420.0, 'iv_rank': 31, 'beta': 1.0, 'option_strike_interval': 2.5},
         'GOOGL': {'price': 165.0, 'iv_rank': 33, 'beta': 1.1, 'option_strike_interval': 2.5},
         'AMZN': {'price': 195.0, 'iv_rank': 36, 'beta': 1.2, 'option_strike_interval': 2.5},
         'META': {'price': 550.0, 'iv_rank': 45, 'beta': 1.3, 'option_strike_interval': 5.0},
         'NVDA': {'price': 140.0, 'iv_rank': 52, 'beta': 1.6, 'option_strike_interval': 2.5},
         'TSLA': {'price': 250.0, 'iv_rank': 55, 'beta': 1.8, 'option_strike_interval': 5.0},
         'AMD': {'price': 120.0, 'iv_rank': 48, 'beta': 1.5, 'option_strike_interval': 1.0},
-        'XLF': {'price': 45.0, 'iv_rank': 28, 'beta': 1.1, 'option_strike_interval': 0.5},
-        'XLE': {'price': 90.0, 'iv_rank': 35, 'beta': 1.2, 'option_strike_interval': 1.0},
-        'XLK': {'price': 210.0, 'iv_rank': 32, 'beta': 1.1, 'option_strike_interval': 1.0},
-        'XLV': {'price': 140.0, 'iv_rank': 25, 'beta': 0.8, 'option_strike_interval': 1.0},
+        'XLF': {'price': 45.0, 'iv_rank': 32, 'beta': 1.1, 'option_strike_interval': 0.5},  # Increased from 28
+        'XLE': {'price': 90.0, 'iv_rank': 38, 'beta': 1.2, 'option_strike_interval': 1.0},  # Increased from 35
+        'XLK': {'price': 210.0, 'iv_rank': 34, 'beta': 1.1, 'option_strike_interval': 1.0},  # Increased from 32
+        'XLV': {'price': 140.0, 'iv_rank': 30, 'beta': 0.8, 'option_strike_interval': 1.0},  # Increased from 25
+        'XLI': {'price': 130.0, 'iv_rank': 35, 'beta': 1.0, 'option_strike_interval': 1.0},  # Added explicitly
+        'XLP': {'price': 80.0, 'iv_rank': 28, 'beta': 0.7, 'option_strike_interval': 0.5},   # Added (low IV, defensive)
+        'XLU': {'price': 75.0, 'iv_rank': 26, 'beta': 0.5, 'option_strike_interval': 0.5},   # Added (low IV, defensive)
+        'XLB': {'price': 95.0, 'iv_rank': 34, 'beta': 1.1, 'option_strike_interval': 1.0},   # Added
+        'XLRE': {'price': 40.0, 'iv_rank': 31, 'beta': 0.9, 'option_strike_interval': 0.5},  # Added
     }
 
     def __init__(self, config: Optional[Dict[str, Any]] = None):

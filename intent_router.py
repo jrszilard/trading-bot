@@ -48,6 +48,10 @@ class TradingIntent(Enum):
     # Risk & Configuration
     GET_RISK_PARAMS = "get_risk_params"
 
+    # Backtesting
+    RUN_BACKTEST = "run_backtest"
+    SHOW_BACKTEST_RESULTS = "show_backtest_results"
+
     # Conversational
     CLARIFICATION = "clarification"
     GENERAL_CHAT = "general_chat"
@@ -102,18 +106,49 @@ class IntentRouter:
 
     # Strategy keywords
     STRATEGY_KEYWORDS = {
+        # Vertical Spreads
         'put spread': 'short_put_spread',
         'call spread': 'short_call_spread',
+        'credit spread': 'short_put_spread',
+        'vertical spread': 'short_put_spread',
+
+        # Multi-leg Premium Selling
         'iron condor': 'iron_condor',
         'strangle': 'short_strangle',
         'straddle': 'short_straddle',
+        'jade lizard': 'jade_lizard',
+        'lizard': 'jade_lizard',
+
+        # Time Spreads
+        'calendar': 'calendar_spread',
+        'calendar spread': 'calendar_spread',
+        'time spread': 'calendar_spread',
+        'diagonal': 'diagonal_spread',
+        'diagonal spread': 'diagonal_spread',
+        'double calendar': 'double_calendar',
+
+        # Naked Options
         'short put': 'short_put',
         'short call': 'short_call',
-        'covered call': 'covered_call',
         'naked put': 'short_put',
         'naked call': 'short_call',
-        'credit spread': 'short_put_spread',
-        'vertical spread': 'short_put_spread'
+
+        # Volatility Expansion
+        'long strangle': 'long_strangle',
+        'long straddle': 'long_straddle',
+        'buy strangle': 'long_strangle',
+        'buy straddle': 'long_straddle',
+
+        # Stock-based
+        'covered call': 'covered_call',
+        'pmcc': 'poor_mans_covered_call',
+        "poor man's covered call": 'poor_mans_covered_call',
+        'collar': 'collar',
+
+        # Ratio & Advanced
+        'ratio spread': 'put_ratio_spread',
+        'broken wing': 'broken_wing_butterfly',
+        'butterfly': 'broken_wing_butterfly'
     }
 
     def __init__(self):
@@ -178,6 +213,17 @@ class IntentRouter:
                 raw_text=text,
                 symbols=symbols,
                 strategy=self._extract_strategy(text_lower)
+            )
+
+        # Backtesting
+        if self._matches_backtest(text_lower):
+            return ParsedIntent(
+                intent=TradingIntent.RUN_BACKTEST,
+                confidence=0.90,
+                raw_text=text,
+                symbols=symbols,
+                strategy=self._extract_strategy(text_lower),
+                parameters=self._extract_backtest_params(text_lower)
             )
 
         # Show pending trades
@@ -342,7 +388,8 @@ class IntentRouter:
             'APPROVE', 'REJECT', 'EXECUTE', 'PENDING', 'TRADE', 'TRADES', 'POSITION', 'POSITIONS',
             'PORTFOLIO', 'DELTA', 'THETA', 'VEGA', 'GAMMA', 'PNL', 'TODAY', 'WEEK', 'MARKET', 'RESEARCH',
             'ANALYZE', 'CHECK', 'HELP', 'ABOUT', 'CAN', 'YOU', 'SHOULD', 'WOULD', 'COULD', 'YES', 'NO',
-            'LOOK', 'LOOKING', 'WITH', 'AND', 'LIKE', 'WANT', 'NEED', 'HAVE', 'HAS', 'HAD', 'WILL', 'ARE'
+            'LOOK', 'LOOKING', 'WITH', 'AND', 'LIKE', 'WANT', 'NEED', 'HAVE', 'HAS', 'HAD', 'WILL', 'ARE',
+            'RUN', 'TEST', 'BACK', 'BACKTEST'
         }
 
         # Look for explicit symbols (uppercase 1-5 letters)
@@ -375,6 +422,39 @@ class IntentRouter:
         if match:
             return match.group(1)
         return None
+
+    def _extract_backtest_params(self, text: str) -> Dict[str, Any]:
+        """Extract backtest parameters from text"""
+        params = {}
+
+        # Extract time period
+        if 'month' in text:
+            months_match = re.search(r'(\d+)\s*month', text)
+            if months_match:
+                params['months'] = int(months_match.group(1))
+            else:
+                params['months'] = 6  # Default to 6 months
+
+        if 'year' in text:
+            years_match = re.search(r'(\d+)\s*year', text)
+            if years_match:
+                params['years'] = int(years_match.group(1))
+            else:
+                params['years'] = 1  # Default to 1 year
+
+        # Extract mode preference
+        if 'api' in text or 'real' in text or 'actual' in text:
+            params['mode'] = 'api'
+        elif 'synthetic' in text or 'simulated' in text:
+            params['mode'] = 'synthetic'
+        else:
+            params['mode'] = 'auto'  # Auto-detect
+
+        # Extract comparison flag
+        if 'compare' in text or 'comparison' in text or 'all strategies' in text:
+            params['compare_strategies'] = True
+
+        return params
 
     # Pattern matching methods
     def _is_confirmation_yes(self, text: str) -> bool:
@@ -450,6 +530,11 @@ class IntentRouter:
     def _matches_manage(self, text: str) -> bool:
         patterns = ['manage', 'check positions', 'should i close', 'roll', 'management',
                     'check if i should close', 'anything to close', 'positions to manage']
+        return any(p in text for p in patterns)
+
+    def _matches_backtest(self, text: str) -> bool:
+        patterns = ['backtest', 'back test', 'historical test', 'test historically',
+                    'past performance', 'simulate', 'how would', 'performance test']
         return any(p in text for p in patterns)
 
     def _matches_market(self, text: str) -> bool:

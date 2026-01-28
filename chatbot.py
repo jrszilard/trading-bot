@@ -99,6 +99,9 @@ class ChatbotInterface:
         # Configuration
         self.router.register_handler(TradingIntent.GET_RISK_PARAMS, self._handle_risk_params)
 
+        # Backtesting
+        self.router.register_handler(TradingIntent.RUN_BACKTEST, self._handle_backtest)
+
         # Conversational
         self.router.register_handler(TradingIntent.HELP, self._handle_help)
         self.router.register_handler(TradingIntent.GENERAL_CHAT, self._handle_general_chat)
@@ -203,10 +206,22 @@ class ChatbotInterface:
         context: Dict[str, Any]
     ) -> str:
         """Handle scan for opportunities"""
-        symbols = parsed.symbols or ['SPY', 'QQQ', 'IWM']
+        # Expanded default symbol universe for open-ended scans
+        # Prioritize liquid, high IV rank opportunities
+        if not parsed.symbols:
+            symbols = [
+                # Major indices (most liquid)
+                'SPY', 'QQQ', 'IWM', 'DIA',
+                # Sector ETFs (high liquidity)
+                'XLF', 'XLE', 'XLK', 'XLV', 'XLI',
+                # Popular high IV stocks
+                'TSLA', 'AMD', 'NVDA'
+            ]
+        else:
+            symbols = parsed.symbols
 
         data_source = "[MOCK DATA] " if self.bot.use_mock_data else ""
-        response_parts = [f"{data_source}Scanning {', '.join(symbols)}..."]
+        response_parts = [f"{data_source}Scanning {', '.join(symbols)} for opportunities..."]
 
         try:
             opportunities = await self.bot.scan_for_opportunities(symbols)
@@ -683,6 +698,113 @@ class ChatbotInterface:
         }
 
         return self.formatter.format_risk_params(params)
+
+    async def _handle_backtest(
+        self,
+        parsed: ParsedIntent,
+        context: Dict[str, Any]
+    ) -> str:
+        """Handle backtest requests"""
+        from datetime import date, timedelta
+        from decimal import Decimal
+        from backtesting import BacktestEngine, BacktestAnalyzer
+
+        params = parsed.parameters or {}
+
+        # Determine time period
+        if 'years' in params:
+            days = params['years'] * 365
+        elif 'months' in params:
+            days = params['months'] * 30
+        else:
+            days = 180  # Default to 6 months
+
+        end_date = date.today()
+        start_date = end_date - timedelta(days=days)
+
+        # Determine symbols
+        symbols = parsed.symbols if parsed.symbols else [
+            'SPY', 'QQQ', 'IWM', 'AAPL', 'TSLA'
+        ]
+
+        # Create backtest engine
+        backtest_engine = BacktestEngine(
+            strategy_engine=self.bot.strategy_engine,
+            initial_capital=Decimal("50000"),
+            max_positions=10
+        )
+
+        try:
+            # Run backtest
+            result = backtest_engine.run_backtest(
+                symbols=symbols,
+                start_date=start_date,
+                end_date=end_date,
+                scan_frequency_days=1
+            )
+
+            # Generate report
+            analyzer = BacktestAnalyzer()
+            report = analyzer.generate_report(result)
+
+            # Also get analysis for recommendations
+            analysis = analyzer.analyze_results(result)
+
+            # Format for display
+            response_lines = [
+                "Backtest Complete!",
+                "=" * 60,
+                "",
+                f"Period: {start_date} to {end_date} ({days} days)",
+                f"Symbols: {', '.join(symbols)}",
+                f"Initial Capital: ${result.initial_capital:,.2f}",
+                f"Final Capital: ${result.final_capital:,.2f}",
+                "",
+                "PERFORMANCE SUMMARY",
+                "-" * 60,
+                f"Total Return: {result.total_return_percent:.2f}%",
+                f"Total P&L: ${result.total_pnl:,.2f}",
+                f"Total Trades: {result.total_trades}",
+                f"Win Rate: {result.win_rate:.2f}%",
+                f"Profit Factor: {result.profit_factor:.2f}",
+                "",
+                "RISK METRICS",
+                "-" * 60,
+                f"Max Drawdown: ${result.max_drawdown:,.2f} ({result.max_drawdown_percent:.2f}%)",
+                f"Sharpe Ratio: {result.sharpe_ratio:.2f}",
+                f"Sortino Ratio: {result.sortino_ratio:.2f}",
+                "",
+                "STRATEGY BREAKDOWN",
+                "-" * 60,
+            ]
+
+            # Add strategy details
+            if result.trades_by_strategy:
+                for strategy, count in sorted(result.trades_by_strategy.items()):
+                    pnl = result.pnl_by_strategy[strategy]
+                    win_rate = result.win_rate_by_strategy[strategy]
+                    response_lines.append(
+                        f"  {strategy:25s}  {count:3d} trades  "
+                        f"${pnl:10,.2f}  {win_rate:6.2f}% wins"
+                    )
+
+            response_lines.extend(["", "KEY RECOMMENDATIONS", "-" * 60])
+
+            # Add recommendations
+            if analysis['recommendations']:
+                for rec in analysis['recommendations'][:5]:  # Top 5
+                    response_lines.append(f"• {rec}")
+            else:
+                response_lines.append("• No major issues identified. Continue current strategy.")
+
+            response_lines.append("")
+            response_lines.append("For the complete detailed report, check the logs.")
+
+            return "\n".join(response_lines)
+
+        except Exception as e:
+            logger.error(f"Error running backtest: {e}", exc_info=True)
+            return f"Failed to run backtest: {str(e)}"
 
     async def _handle_help(
         self,

@@ -19,6 +19,9 @@ anthropic>=0.40.0
 # HTTP client for Brave Search API (dynamic market data)
 httpx>=0.24.0
 
+# Async HTTP client for Tastytrade backtesting API
+aiohttp>=3.13.0
+
 # Optional: For enhanced functionality
 python-dateutil>=2.8.0
 pytz>=2023.3
