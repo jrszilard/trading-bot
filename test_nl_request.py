@@ -238,7 +238,7 @@ async def test_direct_scan(symbol: str):
             print(f"  Source: {data.get('source', 'unknown')}")
 
     # Run scan
-    opportunities = await bot.scan_for_opportunities([symbol])
+    opportunities, all_candidates = await bot.scan_for_opportunities([symbol])
 
     if opportunities:
         print(f"\n[Raw Opportunities Found: {len(opportunities)}]")

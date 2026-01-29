@@ -174,7 +174,7 @@ async def run_comprehensive_test(user_message: str):
 
     # Run the scan - this will log strategy evaluations
     print("  [Running scan...]")
-    opportunities = await bot.scan_for_opportunities([symbol])
+    opportunities, all_candidates = await bot.scan_for_opportunities([symbol])
 
     # The log messages from the scan show strategy evaluation
     # We capture those above via the logging configuration

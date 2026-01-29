@@ -57,6 +57,8 @@ class StrategyType(Enum):
     # Stock-based Strategies
     COVERED_CALL = "covered_call"
     CASH_SECURED_PUT = "cash_secured_put"
+    LONG_STOCK = "long_stock"
+    SHORT_STOCK = "short_stock"
     COLLAR = "collar"
 
 

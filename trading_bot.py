@@ -120,6 +120,7 @@ class TastytradeBot:
         self.portfolio_state = PortfolioState()
         self.pending_trades: List[TradeProposal] = []
         self.trade_history: List[TradeProposal] = []
+        self.mock_positions: List[dict] = []  # Track simulated positions in mock mode
 
         # Watchlist for scanning
         self.watchlist: List[str] = []
@@ -295,18 +296,35 @@ class TastytradeBot:
                     raise
             
             # Get positions and calculate Greeks
-            positions = account.get_positions(self.session)
-            self.portfolio_state.open_positions = len(positions)
-            
-            # Count positions by underlying
-            self.portfolio_state.positions_by_underlying = {}
-            for pos in positions:
-                symbol = pos.underlying_symbol
-                self.portfolio_state.positions_by_underlying[symbol] = \
-                    self.portfolio_state.positions_by_underlying.get(symbol, 0) + 1
+            # Use mock positions in mock mode, otherwise fetch from API
+            if self.use_mock_data and self.mock_positions:
+                positions = self.mock_positions
+                self.portfolio_state.open_positions = len(self.mock_positions)
 
-            # Calculate beta-weighted Greeks using streaming data
-            await self._calculate_beta_weighted_greeks(positions)
+                # Count positions by underlying
+                self.portfolio_state.positions_by_underlying = {}
+                for pos in self.mock_positions:
+                    symbol = pos['symbol']
+                    self.portfolio_state.positions_by_underlying[symbol] = \
+                        self.portfolio_state.positions_by_underlying.get(symbol, 0) + 1
+
+                # Calculate portfolio Greeks from mock positions
+                self.portfolio_state.portfolio_delta = sum(Decimal(str(pos.get('delta', 0))) for pos in self.mock_positions)
+                self.portfolio_state.portfolio_theta = sum(Decimal(str(pos.get('theta', 0))) for pos in self.mock_positions)
+                self.portfolio_state.portfolio_vega = sum(Decimal(str(pos.get('vega', 0))) for pos in self.mock_positions)
+            else:
+                positions = account.get_positions(self.session)
+                self.portfolio_state.open_positions = len(positions)
+
+                # Count positions by underlying
+                self.portfolio_state.positions_by_underlying = {}
+                for pos in positions:
+                    symbol = pos.underlying_symbol
+                    self.portfolio_state.positions_by_underlying[symbol] = \
+                        self.portfolio_state.positions_by_underlying.get(symbol, 0) + 1
+
+                # Calculate beta-weighted Greeks using streaming data
+                await self._calculate_beta_weighted_greeks(positions)
             
             logger.info(f"Portfolio updated: NLV=${self.portfolio_state.net_liquidating_value}, "
                        f"BP=${self.portfolio_state.buying_power}, "
@@ -737,58 +755,61 @@ class TastytradeBot:
             proposal.execution_result = {"error": "Session refresh failed"}
             return False
 
-        # Handle mock data execution (sandbox with synthetic options)
-        if self.use_mock_data and self.sandbox_mode:
-            logger.info(f"[MOCK EXECUTION] Simulating trade {proposal.id} - {proposal.underlying_symbol} {proposal.strategy.value}")
-            logger.info(f"  Credit: ${proposal.expected_credit:.2f} | Max Loss: ${proposal.max_loss:.2f}")
-            for leg in proposal.legs:
-                logger.info(f"  Leg: {leg.get('action')} {leg.get('quantity', 1)}x {leg.get('symbol')}")
-
-            proposal.status = TradeStatus.EXECUTED
-            proposal.execution_result = {
-                "mock_execution": True,
-                "sandbox": True,
-                "message": "Trade simulated with mock data (market closed or using synthetic options)"
-            }
-
-            # Move to history
-            if proposal in self.pending_trades:
-                self.pending_trades.remove(proposal)
-            self.trade_history.append(proposal)
-
-            return True
+        # Try real API execution first (even in mock data mode)
+        # Only fall back to mock execution if API execution fails
 
         try:
             from tastytrade import Account
             from tastytrade.order import NewOrder, OrderAction, OrderTimeInForce, OrderType
+            from tastytrade.instruments import Option, Equity
+            from tastytrade.order import Leg
 
             account = Account.get(self.session)[0]
 
             # Build order legs
             order_legs = []
+
+            # Check if this is a stock trade
+            from models import StrategyType
+            is_stock_trade = proposal.strategy in (StrategyType.LONG_STOCK, StrategyType.SHORT_STOCK)
+
             for leg in proposal.legs:
-                from tastytrade.instruments import Option
-                from tastytrade.order import Leg
+                if is_stock_trade:
+                    # Handle stock trades
+                    instrument_type = 'Equity'
+                    symbol = leg['symbol']
 
-                # Fetch the actual option instrument
-                option = Option.get_option(self.session, leg['symbol'])
+                    # Map stock action
+                    action = OrderAction.BUY_TO_OPEN if leg.get('action') == 'buy' else OrderAction.SELL_TO_OPEN
 
-                # Map action string to OrderAction enum
-                action_map = {
-                    'SELL_TO_OPEN': OrderAction.SELL_TO_OPEN,
-                    'BUY_TO_OPEN': OrderAction.BUY_TO_OPEN,
-                    'SELL_TO_CLOSE': OrderAction.SELL_TO_CLOSE,
-                    'BUY_TO_CLOSE': OrderAction.BUY_TO_CLOSE,
-                }
-                action = action_map.get(leg.get('action', 'SELL_TO_OPEN'), OrderAction.SELL_TO_OPEN)
+                    order_leg = Leg(
+                        instrument_type=instrument_type,
+                        symbol=symbol,
+                        action=action,
+                        quantity=leg.get('quantity', 1)
+                    )
+                    order_legs.append(order_leg)
+                else:
+                    # Handle option trades
+                    # Fetch the actual option instrument
+                    option = Option.get_option(self.session, leg['symbol'])
 
-                order_leg = Leg(
-                    instrument_type=option.instrument_type,
-                    symbol=option.symbol,
-                    action=action,
-                    quantity=leg.get('quantity', 1)
-                )
-                order_legs.append(order_leg)
+                    # Map action string to OrderAction enum
+                    action_map = {
+                        'SELL_TO_OPEN': OrderAction.SELL_TO_OPEN,
+                        'BUY_TO_OPEN': OrderAction.BUY_TO_OPEN,
+                        'SELL_TO_CLOSE': OrderAction.SELL_TO_CLOSE,
+                        'BUY_TO_CLOSE': OrderAction.BUY_TO_CLOSE,
+                    }
+                    action = action_map.get(leg.get('action', 'SELL_TO_OPEN'), OrderAction.SELL_TO_OPEN)
+
+                    order_leg = Leg(
+                        instrument_type=option.instrument_type,
+                        symbol=option.symbol,
+                        action=action,
+                        quantity=leg.get('quantity', 1)
+                    )
+                    order_legs.append(order_leg)
 
             if not order_legs:
                 raise ValueError("No valid order legs could be constructed")
@@ -804,30 +825,75 @@ class TastytradeBot:
             # Dry run first (always)
             dry_run_result = account.place_order(self.session, order, dry_run=True)
             logger.info(f"Dry run result: {dry_run_result}")
-            
+
             if self.sandbox_mode:
-                logger.info(f"SANDBOX MODE: Would execute trade {proposal.id}")
+                # Execute in sandbox (real API execution, not mock)
+                logger.info(f"[SANDBOX API] Executing trade {proposal.id} via Tastytrade API")
+                result = account.place_order(self.session, order, dry_run=False)
                 proposal.status = TradeStatus.EXECUTED
-                proposal.execution_result = {"sandbox": True, "dry_run": str(dry_run_result)}
+                proposal.execution_result = {
+                    "sandbox": True,
+                    "order_id": str(result.order.id) if hasattr(result, 'order') and result.order else None,
+                    "api_execution": True
+                }
+                logger.info(f"[SANDBOX API] Trade {proposal.id} executed: {result}")
             else:
-                # Actually execute
+                # Production execution
                 result = account.place_order(self.session, order, dry_run=False)
                 proposal.status = TradeStatus.EXECUTED
                 proposal.execution_result = {"order_id": str(result.order.id) if result.order else None}
                 logger.info(f"Trade {proposal.id} EXECUTED: {result}")
-            
+
             # Move to history
             if proposal in self.pending_trades:
                 self.pending_trades.remove(proposal)
             self.trade_history.append(proposal)
-            
+
             return True
             
         except Exception as e:
-            logger.error(f"Trade execution failed: {e}")
-            proposal.status = TradeStatus.FAILED
-            proposal.execution_result = {"error": str(e)}
-            return False
+            # Fallback to mock execution if API fails and we're using mock data
+            if self.use_mock_data and self.sandbox_mode:
+                logger.warning(f"API execution failed, falling back to mock execution: {e}")
+                logger.info(f"[MOCK EXECUTION] Simulating trade {proposal.id} - {proposal.underlying_symbol} {proposal.strategy.value}")
+
+                proposal.status = TradeStatus.EXECUTED
+                proposal.execution_result = {
+                    "mock_execution": True,
+                    "sandbox": True,
+                    "reason": "API execution failed",
+                    "api_error": str(e)
+                }
+
+                # Add position to mock positions tracker
+                mock_position = {
+                    'symbol': proposal.underlying_symbol,
+                    'quantity': sum(leg.get('quantity', 0) for leg in proposal.legs),
+                    'strategy': proposal.strategy.value,
+                    'entry_price': float(proposal.expected_credit),
+                    'max_loss': float(proposal.max_loss),
+                    'delta': float(proposal.delta),
+                    'theta': float(proposal.theta),
+                    'vega': float(proposal.vega),
+                    'opened_at': proposal.timestamp.isoformat(),
+                    'trade_id': proposal.id,
+                    'legs': proposal.legs
+                }
+                self.mock_positions.append(mock_position)
+                logger.info(f"[MOCK] Added position to tracker: {proposal.underlying_symbol} (total positions: {len(self.mock_positions)})")
+
+                # Move to history
+                if proposal in self.pending_trades:
+                    self.pending_trades.remove(proposal)
+                self.trade_history.append(proposal)
+
+                return True
+            else:
+                # No fallback available, fail the trade
+                logger.error(f"Trade execution failed: {e}")
+                proposal.status = TradeStatus.FAILED
+                proposal.execution_result = {"error": str(e)}
+                return False
 
     async def close_position(self, position_symbol: str) -> Dict[str, Any]:
         """
@@ -841,21 +907,30 @@ class TastytradeBot:
         """
         result = {'success': False, 'message': '', 'error': None}
 
-        # Use mock data if enabled
-        if self.use_mock_data:
-            logger.info(f"[MOCK] Closing position: {position_symbol}")
-            result['success'] = True
-            result['message'] = f"[SANDBOX] Position {position_symbol} closed successfully (mock)"
-            result['order_id'] = 'mock-close-' + position_symbol.lower()
-            return result
-
+        # Try real API first, fall back to mock only if API unavailable
         if not self.session:
-            result['error'] = "No active session"
-            return result
+            # No session - use mock fallback if enabled
+            if self.use_mock_data and self.sandbox_mode:
+                logger.warning(f"No session available, using mock close for {position_symbol}")
+                result['success'] = True
+                result['message'] = f"[MOCK FALLBACK] Position {position_symbol} closed (no session)"
+                result['order_id'] = 'mock-close-' + position_symbol.lower()
+                return result
+            else:
+                result['error'] = "No active session"
+                return result
 
         if not await self.ensure_session_valid():
-            result['error'] = "Session validation failed"
-            return result
+            # Session invalid - use mock fallback if enabled
+            if self.use_mock_data and self.sandbox_mode:
+                logger.warning(f"Session invalid, using mock close for {position_symbol}")
+                result['success'] = True
+                result['message'] = f"[MOCK FALLBACK] Position {position_symbol} closed (invalid session)"
+                result['order_id'] = 'mock-close-' + position_symbol.lower()
+                return result
+            else:
+                result['error'] = "Session validation failed"
+                return result
 
         try:
             from tastytrade import Account
@@ -942,23 +1017,37 @@ class TastytradeBot:
             dry_run_result = account.place_order(self.session, order, dry_run=True)
             logger.info(f"Close order dry run: {dry_run_result}")
 
+            # Execute via real API
             if self.sandbox_mode:
-                result['success'] = True
-                result['message'] = f"[SANDBOX] Close order submitted for {position_symbol}"
-                result['dry_run'] = str(dry_run_result)
-            else:
+                logger.info(f"[SANDBOX API] Closing position {position_symbol}")
                 order_result = account.place_order(self.session, order, dry_run=False)
                 result['success'] = True
-                result['message'] = f"Close order executed for {position_symbol}"
-                result['order_id'] = str(order_result.order.id) if order_result.order else None
+                result['message'] = f"[SANDBOX API] Position {position_symbol} closed successfully"
+                result['order_id'] = str(order_result.order.id) if hasattr(order_result, 'order') and order_result.order else None
+            else:
+                logger.info(f"Closing position {position_symbol} in production")
+                order_result = account.place_order(self.session, order, dry_run=False)
+                result['success'] = True
+                result['message'] = f"Position {position_symbol} closed successfully"
+                result['order_id'] = str(order_result.order.id) if hasattr(order_result, 'order') and order_result.order else None
 
             logger.info(f"Position {position_symbol} close: {result['message']}")
+            return result
 
         except Exception as e:
-            logger.error(f"Close position failed: {e}")
-            result['error'] = str(e)
-
-        return result
+            # API execution failed - use mock fallback if enabled
+            if self.use_mock_data and self.sandbox_mode:
+                logger.warning(f"API close failed for {position_symbol}, falling back to mock: {e}")
+                result['success'] = True
+                result['message'] = f"[MOCK FALLBACK] Position {position_symbol} closed (API error)"
+                result['order_id'] = 'mock-close-' + position_symbol.lower()
+                result['api_error'] = str(e)
+                return result
+            else:
+                # No fallback available
+                logger.error(f"Close position failed: {e}")
+                result['error'] = str(e)
+                return result
 
     async def roll_position(
         self,
@@ -980,22 +1069,32 @@ class TastytradeBot:
         """
         result = {'success': False, 'message': '', 'error': None, 'net_credit': 0}
 
-        # Use mock data if enabled
-        if self.use_mock_data:
-            logger.info(f"[MOCK] Rolling position: {position_symbol} to ~{target_dte} DTE")
-            result['success'] = True
-            result['message'] = f"[SANDBOX] Position {position_symbol} rolled to ~{target_dte} DTE (mock)"
-            result['net_credit'] = 0.35  # Mock credit
-            result['order_id'] = 'mock-roll-' + position_symbol.lower()
-            return result
-
+        # Try real API first, fall back to mock only if API unavailable
         if not self.session:
-            result['error'] = "No active session"
-            return result
+            # No session - use mock fallback if enabled
+            if self.use_mock_data and self.sandbox_mode:
+                logger.warning(f"No session available, using mock roll for {position_symbol}")
+                result['success'] = True
+                result['message'] = f"[MOCK FALLBACK] Position {position_symbol} rolled to ~{target_dte} DTE (no session)"
+                result['net_credit'] = 0.35
+                result['order_id'] = 'mock-roll-' + position_symbol.lower()
+                return result
+            else:
+                result['error'] = "No active session"
+                return result
 
         if not await self.ensure_session_valid():
-            result['error'] = "Session validation failed"
-            return result
+            # Session invalid - use mock fallback if enabled
+            if self.use_mock_data and self.sandbox_mode:
+                logger.warning(f"Session invalid, using mock roll for {position_symbol}")
+                result['success'] = True
+                result['message'] = f"[MOCK FALLBACK] Position {position_symbol} rolled to ~{target_dte} DTE (invalid session)"
+                result['net_credit'] = 0.35
+                result['order_id'] = 'mock-roll-' + position_symbol.lower()
+                return result
+            else:
+                result['error'] = "Session validation failed"
+                return result
 
         try:
             from tastytrade import Account
@@ -1152,25 +1251,40 @@ class TastytradeBot:
             dry_run_result = account.place_order(self.session, order, dry_run=True)
             logger.info(f"Roll order dry run: {dry_run_result}")
 
+            # Execute via real API
             if self.sandbox_mode:
-                result['success'] = True
-                result['message'] = f"[SANDBOX] Roll order submitted for {position_symbol}"
-                result['net_credit'] = float(net_credit)
-                result['dry_run'] = str(dry_run_result)
-            else:
+                logger.info(f"[SANDBOX API] Rolling position {position_symbol} to ~{target_dte} DTE")
                 order_result = account.place_order(self.session, order, dry_run=False)
                 result['success'] = True
-                result['message'] = f"Roll order executed for {position_symbol}"
+                result['message'] = f"[SANDBOX API] Position {position_symbol} rolled successfully"
                 result['net_credit'] = float(net_credit)
-                result['order_id'] = str(order_result.order.id) if order_result.order else None
+                result['order_id'] = str(order_result.order.id) if hasattr(order_result, 'order') and order_result.order else None
+            else:
+                logger.info(f"Rolling position {position_symbol} in production")
+                order_result = account.place_order(self.session, order, dry_run=False)
+                result['success'] = True
+                result['message'] = f"Position {position_symbol} rolled successfully"
+                result['net_credit'] = float(net_credit)
+                result['order_id'] = str(order_result.order.id) if hasattr(order_result, 'order') and order_result.order else None
 
             logger.info(f"Position {position_symbol} roll: {result['message']} (credit: ${net_credit:.2f})")
+            return result
 
         except Exception as e:
-            logger.error(f"Roll position failed: {e}")
-            result['error'] = str(e)
-
-        return result
+            # API execution failed - use mock fallback if enabled
+            if self.use_mock_data and self.sandbox_mode:
+                logger.warning(f"API roll failed for {position_symbol}, falling back to mock: {e}")
+                result['success'] = True
+                result['message'] = f"[MOCK FALLBACK] Position {position_symbol} rolled to ~{target_dte} DTE (API error)"
+                result['net_credit'] = 0.35
+                result['order_id'] = 'mock-roll-' + position_symbol.lower()
+                result['api_error'] = str(e)
+                return result
+            else:
+                # No fallback available
+                logger.error(f"Roll position failed: {e}")
+                result['error'] = str(e)
+                return result
 
     async def get_position_details(self, position_symbol: str) -> Optional[Dict[str, Any]]:
         """
@@ -1266,7 +1380,7 @@ class TastytradeBot:
             logger.error(f"Get position details failed: {e}")
             return None
 
-    async def scan_for_opportunities(self, symbols: List[str]) -> List[TradeProposal]:
+    async def scan_for_opportunities(self, symbols: List[str]) -> tuple[List[TradeProposal], List[dict]]:
         """
         Scan symbols for trading opportunities based on tastylive criteria
 
@@ -1278,21 +1392,30 @@ class TastytradeBot:
 
         When use_mock_data is enabled (sandbox mode), uses mock market data
         instead of real streaming data.
+
+        Returns:
+            (approved_opportunities, all_candidates_metadata)
         """
         opportunities = []
+        all_candidates_metadata = []
 
-        # Use mock data path if enabled
-        if self.use_mock_data and self.mock_provider:
-            return await self._scan_with_mock_data(symbols)
-
+        # Try real API first if session available, fall back to mock only if no session
         if not self.session:
-            logger.warning("No session - cannot scan for opportunities")
-            return opportunities
+            # No session - use mock data if available
+            if self.use_mock_data and self.mock_provider:
+                logger.info("No session available, using mock data for scan")
+                return await self._scan_with_mock_data(symbols)
+            else:
+                logger.warning("No session - cannot scan for opportunities")
+                return opportunities, all_candidates_metadata
+
+        # Update portfolio state before scanning to ensure current risk checks
+        await self.update_portfolio_state()
 
         # Ensure session token is valid
         if not await self.ensure_session_valid():
             logger.error("Session validation failed")
-            return opportunities
+            return opportunities, all_candidates_metadata
 
         try:
             from tastytrade.instruments import get_option_chain
@@ -1305,9 +1428,25 @@ class TastytradeBot:
             target_exp = get_tasty_monthly()
 
             # Fetch IV Rank for all symbols at once
-            metrics = get_market_metrics(self.session, symbols)
-            iv_ranks = {m.symbol: Decimal(str(m.implied_volatility_index_rank or 0))
-                       for m in metrics}
+            # Note: market-metrics endpoint may not be available in sandbox
+            iv_ranks = {}
+            try:
+                metrics = get_market_metrics(self.session, symbols)
+                iv_ranks = {m.symbol: Decimal(str(m.implied_volatility_index_rank or 0))
+                           for m in metrics}
+                logger.info(f"Retrieved IV ranks from Tastytrade API for {len(iv_ranks)} symbols")
+            except Exception as e:
+                logger.warning(f"Could not fetch IV ranks from API: {e}")
+                # Fall back to mock data provider if available
+                if self.mock_provider:
+                    logger.info("Using mock data provider for IV ranks")
+                    mock_metrics = self.mock_provider.get_market_metrics(symbols)
+                    iv_ranks = {m.symbol: Decimal(str(m.implied_volatility_index_rank))
+                               for m in mock_metrics}
+                else:
+                    # Use default IV rank for all symbols
+                    logger.warning("No IV rank data available, using default 35%")
+                    iv_ranks = {symbol: Decimal("35") for symbol in symbols}
 
             for symbol in symbols:
                 try:
@@ -1513,20 +1652,24 @@ class TastytradeBot:
         except Exception as e:
             logger.error(f"Scan failed: {e}")
 
-        return opportunities
+        return opportunities, all_candidates_metadata
 
-    async def _scan_with_mock_data(self, symbols: List[str]) -> List[TradeProposal]:
+    async def _scan_with_mock_data(self, symbols: List[str]) -> tuple[List[TradeProposal], List[dict]]:
         """
         Scan for opportunities using mock market data with multi-strategy evaluation.
 
         Evaluates put spreads, call spreads, and iron condors for each symbol,
         ranking them by Kelly Criterion score and returning the best candidates.
+
+        Returns:
+            (approved_opportunities, all_candidates_metadata)
         """
         opportunities = []
+        all_candidates_metadata = []  # NEW: Track ALL evaluated candidates
 
         if not self.mock_provider:
             logger.error("Mock provider not available")
-            return opportunities
+            return opportunities, all_candidates_metadata
 
         # Update portfolio state for risk checks
         await self.update_portfolio_state()
@@ -1614,6 +1757,22 @@ class TastytradeBot:
                                    f"Credit=${cand.net_credit:.2f} | MaxLoss=${cand.max_loss:.2f} | "
                                    f"POP={cand.probability_of_profit:.0%} | RoR={ror:.1f}% | "
                                    f"Kelly={cand.score:.3f}")
+
+                # NEW: Store metadata for ALL candidates (for user option selection)
+                for idx, cand in enumerate(candidates, start=1):
+                    all_candidates_metadata.append({
+                        'option_number': idx,
+                        'symbol': symbol,
+                        'strategy': cand.strategy.value,
+                        'credit': float(cand.net_credit),
+                        'max_loss': float(cand.max_loss),
+                        'pop': float(cand.probability_of_profit),
+                        'kelly_score': float(cand.score),
+                        'dte': cand.dte,
+                        'legs': cand.legs,
+                        'greeks': cand.greeks,
+                        'iv_rank': float(iv_rank)
+                    })
 
                 # Select the best candidate (highest Kelly score)
                 best = candidates[0]
@@ -1716,8 +1875,8 @@ class TastytradeBot:
                 logger.debug(traceback.format_exc())
                 continue
 
-        logger.info(f"Mock scan complete: found {len(opportunities)} opportunities")
-        return opportunities
+        logger.info(f"Mock scan complete: found {len(opportunities)} opportunities, {len(all_candidates_metadata)} total candidates")
+        return opportunities, all_candidates_metadata
     
     async def manage_positions(self) -> List[dict]:
         """

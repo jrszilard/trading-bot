@@ -74,6 +74,8 @@ class ChatbotInterface:
         """Register all intent handlers"""
         # Trading operations
         self.router.register_handler(TradingIntent.SCAN_OPPORTUNITIES, self._handle_scan)
+        self.router.register_handler(TradingIntent.CREATE_TRADE, self._handle_create_trade)
+        self.router.register_handler(TradingIntent.SELECT_OPTION, self._handle_select_option)
         self.router.register_handler(TradingIntent.SHOW_PENDING, self._handle_pending)
         self.router.register_handler(TradingIntent.APPROVE_TRADE, self._handle_approve)
         self.router.register_handler(TradingIntent.REJECT_TRADE, self._handle_reject)
@@ -224,12 +226,44 @@ class ChatbotInterface:
         response_parts = [f"{data_source}Scanning {', '.join(symbols)} for opportunities..."]
 
         try:
-            opportunities = await self.bot.scan_for_opportunities(symbols)
+            # Unpack both approved opportunities and all candidates
+            opportunities, all_candidates = await self.bot.scan_for_opportunities(symbols)
+
+            # Store candidates in conversation context for option selection
+            self.conversation.context.entities.last_scan_candidates = all_candidates
+            if symbols:
+                self.conversation.context.entities.last_scan_symbol = symbols[0]
+
+            # If no approved opportunities but candidates exist, show filtered candidates
+            if not opportunities and all_candidates:
+                response_parts = [
+                    f"{data_source}Found {len(all_candidates)} potential strateg{'y' if len(all_candidates) == 1 else 'ies'}:",
+                    ""
+                ]
+
+                for candidate in all_candidates:
+                    opt_num = candidate['option_number']
+                    strategy = candidate['strategy']
+                    symbol = candidate['symbol']
+                    credit = candidate['credit']
+                    max_loss = candidate['max_loss']
+                    pop = candidate['pop']
+                    kelly = candidate['kelly_score']
+
+                    response_parts.append(
+                        f"{opt_num}. {strategy} on {symbol}\n"
+                        f"   Credit: ${credit:.2f} | Max Loss: ${max_loss:.2f}\n"
+                        f"   POP: {pop:.0%} | Kelly: {kelly:.3f}"
+                    )
+
+                response_parts.append("")
+                response_parts.append("These were filtered by risk criteria. To create one anyway, say 'option [number]'.")
+                return "\n".join(response_parts)
 
             if not opportunities:
                 return f"{data_source}No opportunities found on {', '.join(symbols)} meeting criteria."
 
-            # Format results
+            # Format approved results
             results = []
             for opp in opportunities:
                 results.append({
@@ -248,6 +282,60 @@ class ChatbotInterface:
         except Exception as e:
             logger.error(f"Scan error: {e}")
             return f"Error scanning: {str(e)}"
+
+    async def _handle_select_option(
+        self,
+        parsed: ParsedIntent,
+        context: Dict[str, Any]
+    ) -> str:
+        """Handle user selecting an option from scan results"""
+        from models import StrategyType, TradeStatus
+        from conversation import ConversationState
+        from decimal import Decimal
+
+        # Update portfolio state before creating trade (to get current NLV/BP for risk checks)
+        await self.bot.update_portfolio_state()
+
+        # Get option number from parsed intent
+        option_num = parsed.parameters.get('option_number', 1)
+
+        # Get stored candidates
+        candidates = self.conversation.context.entities.last_scan_candidates
+
+        if not candidates:
+            return "No scan results to select from. Run a scan first."
+
+        # Validate option number
+        if option_num < 1 or option_num > len(candidates):
+            return f"Invalid option. Please choose 1-{len(candidates)}."
+
+        # Get selected candidate (1-indexed from user, but list is already 1-indexed)
+        selected = next((c for c in candidates if c['option_number'] == option_num), None)
+
+        if not selected:
+            return f"Could not find option {option_num}."
+
+        # Create trade proposal from selected candidate
+        proposal = await self.bot.propose_trade(
+            strategy=StrategyType(selected['strategy']),
+            underlying=selected['symbol'],
+            legs=selected['legs'],
+            greeks=selected['greeks'],
+            iv_rank=Decimal(str(selected['iv_rank'])),
+            claude_analysis=None  # User override, skip Claude
+        )
+
+        if not proposal:
+            return "Failed to create trade proposal (risk limits exceeded)."
+
+        # Update conversation context
+        self.conversation.context.entities.trade_id = proposal.id
+        self.conversation.context.state = ConversationState.AWAITING_APPROVAL
+
+        return (f"Created trade proposal from option {option_num}:\n"
+                f"[{proposal.id}] {proposal.underlying_symbol} {proposal.strategy.value}\n"
+                f"Credit: ${proposal.expected_credit:.2f} | Max Loss: ${proposal.max_loss:.2f}\n\n"
+                f"Approve this trade? (yes/no)")
 
     async def _handle_pending(
         self,
@@ -387,6 +475,119 @@ class ChatbotInterface:
             trade.id[:8], "execute", success, sandbox
         )
 
+    async def _handle_create_trade(
+        self,
+        parsed: ParsedIntent,
+        context: Dict[str, Any]
+    ) -> str:
+        """Handle direct trade creation requests (buy X shares of Y)"""
+        from models import TradeProposal, StrategyType, TradeStatus
+        from conversation import ConversationState
+        from decimal import Decimal
+        from datetime import datetime
+        import uuid
+
+        # Update portfolio state before creating trade (to get current NLV/BP for risk checks)
+        await self.bot.update_portfolio_state()
+
+        # Validate inputs
+        if not parsed.symbols or len(parsed.symbols) == 0:
+            return "Which symbol do you want to trade?"
+
+        symbol = parsed.symbols[0]
+        action = parsed.action  # "buy" or "sell"
+        params = parsed.parameters or {}
+        quantity = params.get('quantity', 1)
+        instrument_type = params.get('instrument_type', 'stock')
+
+        # For stock purchases, create a simple stock position proposal
+        if instrument_type == 'stock':
+            # Get current price (from API or mock data)
+            if self.bot.use_mock_data and self.bot.mock_provider:
+                quote = self.bot.mock_provider.get_quote(symbol, is_option=False)
+                price = (quote.bid_price + quote.ask_price) / 2
+            else:
+                # Use real API to get current price
+                # For now, we'll need to fetch the quote
+                try:
+                    await self.bot.update_portfolio_state()
+                    # Try to get price from session
+                    if self.bot.session:
+                        from tastytrade import DXLinkStreamer
+                        async with DXLinkStreamer(self.bot.session) as streamer:
+                            await streamer.subscribe_quote([symbol])
+                            quote = await streamer.get_event(symbol)
+                            if quote:
+                                price = (quote.bidPrice + quote.askPrice) / 2
+                            else:
+                                return f"Could not get current price for {symbol}"
+                    else:
+                        return "No active session to get price data"
+                except Exception as e:
+                    logger.error(f"Error getting price for {symbol}: {e}")
+                    return f"Error getting price for {symbol}: {str(e)}"
+
+            # Calculate cost
+            total_cost = price * quantity
+
+            # Create a simplified TradeProposal for stock
+            leg = {
+                'symbol': symbol,
+                'instrument_type': 'stock',
+                'quantity': quantity,
+                'action': action,  # "buy" or "sell"
+                'price': price,
+                'total_cost': total_cost
+            }
+
+            proposal = TradeProposal(
+                id=str(uuid.uuid4())[:8],
+                timestamp=datetime.now(),
+                strategy=StrategyType.LONG_STOCK if action == "buy" else StrategyType.SHORT_STOCK,
+                underlying_symbol=symbol,
+                legs=[leg],
+                expected_credit=Decimal("-" + str(total_cost)) if action == "buy" else Decimal(str(total_cost)),
+                max_loss=Decimal(str(total_cost)) if action == "buy" else Decimal("999999"),  # unlimited for short
+                probability_of_profit=Decimal("0.50"),  # 50/50 for directional stock
+                iv_rank=Decimal("0"),
+                dte=0,  # stocks don't expire
+                delta=Decimal(str(quantity)) if action == "buy" else Decimal(str(-quantity)),
+                theta=Decimal("0"),
+                vega=Decimal("0"),
+                rationale=f"{action.capitalize()} {quantity} share{'s' if quantity > 1 else ''} of {symbol} at ${price:.2f}"
+            )
+
+            # Check risk limits
+            passed, reason = self.bot.check_risk_limits(proposal)
+            if not passed:
+                return f"Cannot create trade: {reason}"
+
+            # Add to pending trades
+            self.bot.pending_trades.append(proposal)
+
+            # Update conversation context
+            self.conversation.context.entities.trade_id = proposal.id
+            self.conversation.context.state = ConversationState.AWAITING_APPROVAL
+
+            data_source = "[MOCK DATA] " if self.bot.use_mock_data else ""
+            return (f"{data_source}Created trade proposal [{proposal.id}]:\n"
+                    f"{action.capitalize()} {quantity} share{'s' if quantity > 1 else ''} of {symbol}\n"
+                    f"Estimated price: ${price:.2f}\n"
+                    f"Total cost: ${total_cost:.2f}\n\n"
+                    f"Approve this trade? (yes/no)")
+
+        # For options, need more info (strike, expiration)
+        elif instrument_type in ('call', 'put'):
+            # Set research context and ask for strike/expiration
+            self.conversation.context.entities.last_research_symbol = symbol
+            self.conversation.context.entities.pending_action = f"{action}_{instrument_type}"
+            return (f"To {action} {instrument_type}s on {symbol}, I need:\n"
+                    f"• Strike price\n"
+                    f"• Expiration date\n\n"
+                    f"Or would you like me to scan {symbol} for optimal {instrument_type} strategies?")
+
+        return "I didn't understand the trade request. Can you clarify?"
+
     async def _handle_portfolio(
         self,
         parsed: ParsedIntent,
@@ -412,18 +613,40 @@ class ChatbotInterface:
         context: Dict[str, Any]
     ) -> str:
         """Handle show positions"""
-        # For now, return position count from portfolio state
+        # Update portfolio state
         await self.bot.update_portfolio_state()
 
-        positions = self.bot.portfolio_state.positions_by_underlying
-        if not positions:
-            return "No open positions."
+        # Show detailed mock positions if available
+        if self.bot.use_mock_data and self.bot.mock_positions:
+            if not self.bot.mock_positions:
+                return "No open positions."
 
-        lines = ["Current Positions", "-" * 30]
-        for symbol, count in positions.items():
-            lines.append(f"  {symbol}: {count} position(s)")
+            data_source = "[MOCK DATA] " if self.bot.use_mock_data else ""
+            lines = [f"{data_source}Current Positions", "-" * 50]
 
-        return "\n".join(lines)
+            for pos in self.bot.mock_positions:
+                symbol = pos['symbol']
+                qty = pos.get('quantity', 0)
+                strategy = pos.get('strategy', 'unknown')
+                delta = pos.get('delta', 0)
+
+                lines.append(f"\n{symbol} - {strategy}")
+                lines.append(f"  Quantity: {qty}")
+                lines.append(f"  Delta: {delta:.2f}")
+                lines.append(f"  Entry: ${pos.get('entry_price', 0):.2f}")
+
+            return "\n".join(lines)
+        else:
+            # Use standard positions from portfolio state
+            positions = self.bot.portfolio_state.positions_by_underlying
+            if not positions:
+                return "No open positions."
+
+            lines = ["Current Positions", "-" * 30]
+            for symbol, count in positions.items():
+                lines.append(f"  {symbol}: {count} position(s)")
+
+            return "\n".join(lines)
 
     async def _handle_buying_power(
         self,
@@ -892,7 +1115,7 @@ class ChatbotInterface:
 
             if symbol:
                 # Scan and create trade
-                opportunities = await self.bot.scan_for_opportunities([symbol])
+                opportunities, _ = await self.bot.scan_for_opportunities([symbol])
                 if opportunities:
                     trade = opportunities[0]
                     self.conversation.context.entities.trade_id = trade.id
@@ -901,6 +1124,14 @@ class ChatbotInterface:
                            f"Use 'approve' to approve this trade."
                 else:
                     return f"Could not create trade for {symbol}. Criteria not met."
+
+        # Handle trade approval (from CREATE_TRADE or SELECT_OPTION)
+        if state == ConversationState.AWAITING_APPROVAL:
+            trade_id = self.conversation.context.entities.trade_id
+            if trade_id:
+                # Approve the trade
+                parsed.trade_id = trade_id
+                return await self._handle_approve(parsed, context)
 
         self.conversation.context.clear_state()
         return "Confirmed. What would you like to do next?"

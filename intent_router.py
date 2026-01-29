@@ -23,6 +23,8 @@ class TradingIntent(Enum):
 
     # Trading Operations
     SCAN_OPPORTUNITIES = "scan_opportunities"
+    CREATE_TRADE = "create_trade"
+    SELECT_OPTION = "select_option"
     SHOW_PENDING = "show_pending"
     APPROVE_TRADE = "approve_trade"
     REJECT_TRADE = "reject_trade"
@@ -193,6 +195,26 @@ class IntentRouter:
                 intent=TradingIntent.HELP,
                 confidence=0.95,
                 raw_text=text
+            )
+
+        # Select option from scan results (option 2, #1, etc.)
+        if self._matches_select_option(text_lower):
+            return ParsedIntent(
+                intent=TradingIntent.SELECT_OPTION,
+                confidence=0.90,
+                raw_text=text,
+                parameters={'option_number': self._extract_option_number(text_lower)}
+            )
+
+        # Create trade directly (buy X shares of Y, sell Z calls, etc.)
+        if self._matches_create_trade(text_lower):
+            return ParsedIntent(
+                intent=TradingIntent.CREATE_TRADE,
+                confidence=0.85,
+                raw_text=text,
+                symbols=symbols,
+                action=self._extract_trade_action(text_lower),
+                parameters=self._extract_trade_parameters(text_lower)
             )
 
         # Research/strategy analysis (check before scan since both can match)
@@ -389,7 +411,7 @@ class IntentRouter:
             'PORTFOLIO', 'DELTA', 'THETA', 'VEGA', 'GAMMA', 'PNL', 'TODAY', 'WEEK', 'MARKET', 'RESEARCH',
             'ANALYZE', 'CHECK', 'HELP', 'ABOUT', 'CAN', 'YOU', 'SHOULD', 'WOULD', 'COULD', 'YES', 'NO',
             'LOOK', 'LOOKING', 'WITH', 'AND', 'LIKE', 'WANT', 'NEED', 'HAVE', 'HAS', 'HAD', 'WILL', 'ARE',
-            'RUN', 'TEST', 'BACK', 'BACKTEST'
+            'RUN', 'TEST', 'BACK', 'BACKTEST', 'SHARE', 'SHARES', 'STOCK', 'STOCKS', 'CONTRACT', 'CONTRACTS'
         }
 
         # Look for explicit symbols (uppercase 1-5 letters)
@@ -581,6 +603,87 @@ class IntentRouter:
             elif p in text:
                 return True
         return False
+
+    def _matches_select_option(self, text: str) -> bool:
+        """Match option selection patterns (option 2, #1, the second one)"""
+        patterns = [
+            r'option\s+\d+',
+            r'#\d+',
+            r'\b(first|second|third|1st|2nd|3rd)\s+(one|option|choice)',
+            r'go with\s+(option\s+)?\d+',
+            r'(choose|pick|select)\s+(option\s+)?\d+',
+            r'let\'?s?\s+go\s+with\s+(option\s+)?\d+',
+            r'i\'?ll\s+take\s+(option\s+)?\d+',
+        ]
+        for p in patterns:
+            if re.search(p, text, re.IGNORECASE):
+                return True
+        return False
+
+    def _matches_create_trade(self, text: str) -> bool:
+        """Match buy/sell trade requests"""
+        patterns = [
+            r'\b(buy|purchase|long)\b.*\b(share|stock|call|put|contract)s?\b',
+            r'\b(sell|short)\b.*\b(share|stock|call|put|contract)s?\b',
+            r'\b\d+\s+(share|stock|call|put|contract)s?\s+of\b',
+            r'\b(buy|sell|purchase|short|long)\b.*\b[A-Z]{1,5}\b',
+        ]
+        for p in patterns:
+            if re.search(p, text, re.IGNORECASE):
+                return True
+        return False
+
+    def _extract_option_number(self, text: str) -> int:
+        """Extract option number from text (option 2 -> 2, #3 -> 3)"""
+        # Try "option 2", "#2" pattern
+        match = re.search(r'(?:option|#)\s*(\d+)', text, re.IGNORECASE)
+        if match:
+            return int(match.group(1))
+
+        # Try ordinal words
+        ordinals = {
+            'first': 1, '1st': 1,
+            'second': 2, '2nd': 2,
+            'third': 3, '3rd': 3,
+            'fourth': 4, '4th': 4,
+            'fifth': 5, '5th': 5
+        }
+        text_lower = text.lower()
+        for word, num in ordinals.items():
+            if word in text_lower:
+                return num
+
+        return 1  # default
+
+    def _extract_trade_action(self, text: str) -> str:
+        """Extract buy/sell action from text"""
+        if re.search(r'\b(buy|purchase|long)\b', text, re.IGNORECASE):
+            return "buy"
+        elif re.search(r'\b(sell|short)\b', text, re.IGNORECASE):
+            return "sell"
+        return "buy"  # default
+
+    def _extract_trade_parameters(self, text: str) -> Dict[str, Any]:
+        """Extract quantity and instrument type from text"""
+        params = {
+            'quantity': 1,
+            'instrument_type': 'stock'
+        }
+
+        # Extract quantity (1 share, 5 shares, etc.)
+        qty_match = re.search(r'(\d+)\s+(share|stock|call|put|contract)', text, re.IGNORECASE)
+        if qty_match:
+            params['quantity'] = int(qty_match.group(1))
+
+        # Extract instrument type
+        if re.search(r'\bcall', text, re.IGNORECASE):
+            params['instrument_type'] = 'call'
+        elif re.search(r'\bput', text, re.IGNORECASE):
+            params['instrument_type'] = 'put'
+        elif re.search(r'\b(share|stock)', text, re.IGNORECASE):
+            params['instrument_type'] = 'stock'
+
+        return params
 
     async def route(
         self,

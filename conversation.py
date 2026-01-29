@@ -68,6 +68,10 @@ class ActiveEntities:
     pending_close_position: Optional[Dict[str, Any]] = None
     pending_roll_position: Optional[Dict[str, Any]] = None
 
+    # Scan results context (for option selection)
+    last_scan_candidates: List[Dict[str, Any]] = field(default_factory=list)
+    last_scan_symbol: Optional[str] = None
+
     def update_from_entities(self, entities: Dict[str, Any]) -> None:
         """Update active entities from parsed intent entities"""
         if entities.get('symbols'):

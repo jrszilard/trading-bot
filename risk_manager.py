@@ -64,28 +64,37 @@ def check_risk_limits(
         return False, f"Max positions for {proposal.underlying_symbol} reached ({params.max_positions_per_underlying})"
 
     # Check buying power usage
-    if state.buying_power > 0:
-        bp_usage = (state.buying_power - proposal.max_loss) / state.buying_power
-        if bp_usage < params.min_buying_power_reserve:
-            return False, f"Insufficient buying power reserve (need {params.min_buying_power_reserve:.0%})"
-    elif state.buying_power <= 0:
-        if sandbox_mode and state.net_liquidating_value > 0:
-            # Sandbox with 0 BP but positive NLV - skip check (uninitialized sandbox account)
-            logger.debug("Sandbox mode: skipping BP reserve check (BP=0, NLV>0)")
-        else:
-            # Production mode or no NLV - reject trade
+    # In sandbox mode with positive NLV, skip BP checks (common for test accounts)
+    logger.debug(f"BP Check: sandbox_mode={sandbox_mode}, NLV={state.net_liquidating_value}, BP={state.buying_power}")
+
+    if not (sandbox_mode and state.net_liquidating_value > 0):
+        if state.buying_power > 0:
+            bp_usage = (state.buying_power - proposal.max_loss) / state.buying_power
+            if bp_usage < params.min_buying_power_reserve:
+                return False, f"Insufficient buying power reserve (need {params.min_buying_power_reserve:.0%})"
+        elif state.buying_power <= 0:
+            # Production mode with no BP - reject trade
+            logger.warning(f"Rejecting trade: BP=0 (sandbox={sandbox_mode}, NLV={state.net_liquidating_value})")
             return False, "Insufficient buying power (BP=0)"
+    else:
+        logger.info("Sandbox mode: skipping buying power checks (BP checks not applicable)")
 
     # Check IV Rank (tastylive: enter when IV is elevated)
-    if proposal.iv_rank < params.min_iv_rank:
+    # Skip for stock trades (stocks don't have IV rank)
+    from models import StrategyType
+    is_stock_trade = proposal.strategy in (StrategyType.LONG_STOCK, StrategyType.SHORT_STOCK)
+
+    if not is_stock_trade and proposal.iv_rank < params.min_iv_rank:
         return False, f"IV Rank {proposal.iv_rank} below minimum {params.min_iv_rank}"
 
     # Check probability of profit
-    if proposal.probability_of_profit < params.min_probability_otm:
+    # Skip for stock trades (50/50 directional bet)
+    if not is_stock_trade and proposal.probability_of_profit < params.min_probability_otm:
         return False, f"Probability {proposal.probability_of_profit:.0%} below minimum {params.min_probability_otm:.0%}"
 
     # Check DTE range (tastylive: ~45 DTE)
-    if not (params.min_dte <= proposal.dte <= params.max_dte):
+    # Skip for stock trades (stocks don't expire)
+    if not is_stock_trade and not (params.min_dte <= proposal.dte <= params.max_dte):
         return False, f"DTE {proposal.dte} outside range {params.min_dte}-{params.max_dte}"
 
     # Check portfolio delta impact
