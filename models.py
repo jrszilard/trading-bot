@@ -131,6 +131,19 @@ class TradeProposal:
     # Claude AI analysis
     claude_analysis: Optional[Dict[str, Any]] = None
     claude_confidence: Optional[int] = None
+    # Limit price for order execution (defaults to expected_credit)
+    limit_price: Optional[Decimal] = None
+    # Order tracking for working (unfilled) orders
+    order_id: Optional[str] = None
+    order_status: Optional[str] = None  # "working", "filled", "cancelled", "rejected"
+
+    def get_limit_price(self) -> Decimal:
+        """Get the limit price for order execution. Uses limit_price if set, otherwise expected_credit."""
+        return self.limit_price if self.limit_price is not None else self.expected_credit
+
+    def set_limit_price(self, price: Decimal) -> None:
+        """Set a custom limit price for the order."""
+        self.limit_price = price
 
 
 @dataclass

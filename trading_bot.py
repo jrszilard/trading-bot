@@ -814,13 +814,15 @@ class TastytradeBot:
             if not order_legs:
                 raise ValueError("No valid order legs could be constructed")
             
-            # Create the order
+            # Create the order using limit_price (or expected_credit as fallback)
+            limit_price = proposal.get_limit_price()
             order = NewOrder(
                 time_in_force=OrderTimeInForce.DAY,
                 order_type=OrderType.LIMIT,
                 legs=order_legs,
-                price=-proposal.expected_credit  # Negative = credit
+                price=-limit_price  # Negative = credit
             )
+            logger.info(f"Creating LIMIT order at ${limit_price:.2f} (expected credit: ${proposal.expected_credit:.2f})")
             
             # Dry run first (always)
             dry_run_result = account.place_order(self.session, order, dry_run=True)
@@ -828,21 +830,36 @@ class TastytradeBot:
 
             if self.sandbox_mode:
                 # Execute in sandbox (real API execution, not mock)
-                logger.info(f"[SANDBOX API] Executing trade {proposal.id} via Tastytrade API")
+                logger.info(f"[SANDBOX API] Executing trade {proposal.id} via Tastytrade API at limit ${limit_price:.2f}")
                 result = account.place_order(self.session, order, dry_run=False)
+
+                # Extract order ID and track working order
+                order_id = str(result.order.id) if hasattr(result, 'order') and result.order else None
+                proposal.order_id = order_id
+                proposal.order_status = "working"  # Order is now working (may not be filled yet)
                 proposal.status = TradeStatus.EXECUTED
                 proposal.execution_result = {
                     "sandbox": True,
-                    "order_id": str(result.order.id) if hasattr(result, 'order') and result.order else None,
-                    "api_execution": True
+                    "order_id": order_id,
+                    "api_execution": True,
+                    "limit_price": str(limit_price)
                 }
-                logger.info(f"[SANDBOX API] Trade {proposal.id} executed: {result}")
+                logger.info(f"[SANDBOX API] Trade {proposal.id} submitted: Order ID {order_id}, Limit ${limit_price:.2f}")
             else:
                 # Production execution
+                logger.info(f"[PRODUCTION] Executing trade {proposal.id} via Tastytrade API at limit ${limit_price:.2f}")
                 result = account.place_order(self.session, order, dry_run=False)
+
+                # Extract order ID and track working order
+                order_id = str(result.order.id) if result.order else None
+                proposal.order_id = order_id
+                proposal.order_status = "working"  # Order is now working (may not be filled yet)
                 proposal.status = TradeStatus.EXECUTED
-                proposal.execution_result = {"order_id": str(result.order.id) if result.order else None}
-                logger.info(f"Trade {proposal.id} EXECUTED: {result}")
+                proposal.execution_result = {
+                    "order_id": order_id,
+                    "limit_price": str(limit_price)
+                }
+                logger.info(f"[PRODUCTION] Trade {proposal.id} submitted: Order ID {order_id}, Limit ${limit_price:.2f}")
 
             # Move to history
             if proposal in self.pending_trades:
@@ -2151,7 +2168,295 @@ class TastytradeBot:
     def get_trade_history(self, limit: int = 50) -> List[TradeProposal]:
         """Get recent trade history"""
         return self.trade_history[-limit:]
-    
+
+    # =========================================================================
+    # WORKING ORDER MANAGEMENT
+    # =========================================================================
+
+    def get_working_orders(self) -> List[TradeProposal]:
+        """
+        Get all working (submitted but not yet filled) orders.
+
+        Returns:
+            List of TradeProposal with order_status == 'working'
+        """
+        working = []
+        # Check pending trades
+        for t in self.pending_trades:
+            if t.order_status == "working":
+                working.append(t)
+        # Check trade history (executed trades that may still be working)
+        for t in self.trade_history:
+            if t.order_status == "working":
+                working.append(t)
+        return working
+
+    async def check_order_status(self, trade_id: str) -> Optional[Dict[str, Any]]:
+        """
+        Check the current status of a working order via API.
+
+        Args:
+            trade_id: The trade proposal ID
+
+        Returns:
+            Dict with order status info or None if not found
+        """
+        # Find the trade
+        trade = None
+        for t in self.pending_trades + self.trade_history:
+            if t.id.startswith(trade_id) or t.id == trade_id:
+                trade = t
+                break
+
+        if not trade or not trade.order_id:
+            return None
+
+        if not self.session:
+            return {
+                "trade_id": trade.id[:8],
+                "order_id": trade.order_id,
+                "status": trade.order_status or "unknown",
+                "limit_price": str(trade.get_limit_price()),
+                "api_available": False
+            }
+
+        try:
+            from tastytrade import Account
+
+            account = Account.get(self.session)[0]
+            orders = account.get_live_orders(self.session)
+
+            # Find our order
+            for order in orders:
+                if str(order.id) == trade.order_id:
+                    status = order.status.value if hasattr(order.status, 'value') else str(order.status)
+                    trade.order_status = status.lower()
+                    return {
+                        "trade_id": trade.id[:8],
+                        "order_id": trade.order_id,
+                        "status": status,
+                        "limit_price": str(trade.get_limit_price()),
+                        "filled_quantity": getattr(order, 'filled_quantity', 0),
+                        "remaining_quantity": getattr(order, 'remaining_quantity', 0),
+                        "api_available": True
+                    }
+
+            # Order not found in live orders - may be filled or cancelled
+            trade.order_status = "filled"  # Assume filled if not in live orders
+            return {
+                "trade_id": trade.id[:8],
+                "order_id": trade.order_id,
+                "status": "filled",
+                "limit_price": str(trade.get_limit_price()),
+                "api_available": True
+            }
+
+        except Exception as e:
+            logger.error(f"Failed to check order status: {e}")
+            return {
+                "trade_id": trade.id[:8],
+                "order_id": trade.order_id,
+                "status": trade.order_status or "unknown",
+                "limit_price": str(trade.get_limit_price()),
+                "error": str(e),
+                "api_available": False
+            }
+
+    def modify_limit_price(self, trade_id: str, new_price: Decimal) -> Dict[str, Any]:
+        """
+        Modify the limit price for a pending or approved trade.
+
+        Note: This modifies the local proposal price. If the order is already
+        working, you'll need to cancel and resubmit.
+
+        Args:
+            trade_id: The trade proposal ID
+            new_price: The new limit price
+
+        Returns:
+            Dict with success status and message
+        """
+        result = {"success": False, "message": "", "old_price": None, "new_price": None}
+
+        # Find the trade
+        trade = None
+        for t in self.pending_trades:
+            if t.id.startswith(trade_id) or t.id == trade_id:
+                trade = t
+                break
+
+        if not trade:
+            result["message"] = f"Trade {trade_id} not found in pending trades"
+            return result
+
+        # Can only modify pending or approved trades
+        if trade.status not in [TradeStatus.PENDING_APPROVAL, TradeStatus.APPROVED]:
+            result["message"] = f"Cannot modify price for trade in status: {trade.status.value}"
+            return result
+
+        # Check if order is already working
+        if trade.order_status == "working":
+            result["message"] = (
+                f"Order is already working. Cancel the order first, "
+                f"then modify the price and resubmit."
+            )
+            result["order_id"] = trade.order_id
+            return result
+
+        old_price = trade.get_limit_price()
+        trade.set_limit_price(new_price)
+
+        result["success"] = True
+        result["old_price"] = str(old_price)
+        result["new_price"] = str(new_price)
+        result["message"] = f"Limit price updated from ${old_price:.2f} to ${new_price:.2f}"
+        logger.info(f"Modified limit price for trade {trade.id}: ${old_price:.2f} -> ${new_price:.2f}")
+
+        return result
+
+    async def cancel_order(self, trade_id: str) -> Dict[str, Any]:
+        """
+        Cancel a working order.
+
+        Args:
+            trade_id: The trade proposal ID
+
+        Returns:
+            Dict with success status and message
+        """
+        result = {"success": False, "message": ""}
+
+        # Find the trade
+        trade = None
+        for t in self.pending_trades + self.trade_history:
+            if t.id.startswith(trade_id) or t.id == trade_id:
+                trade = t
+                break
+
+        if not trade:
+            result["message"] = f"Trade {trade_id} not found"
+            return result
+
+        if not trade.order_id:
+            result["message"] = f"Trade {trade_id} has no associated order"
+            return result
+
+        if trade.order_status != "working":
+            result["message"] = f"Order is not working (status: {trade.order_status})"
+            return result
+
+        if not self.session:
+            result["message"] = "No active session to cancel order"
+            return result
+
+        try:
+            from tastytrade import Account
+
+            account = Account.get(self.session)[0]
+
+            # Get live orders to find the one to cancel
+            orders = account.get_live_orders(self.session)
+            target_order = None
+            for order in orders:
+                if str(order.id) == trade.order_id:
+                    target_order = order
+                    break
+
+            if not target_order:
+                # Order not found - may already be filled/cancelled
+                trade.order_status = "cancelled"
+                result["success"] = True
+                result["message"] = f"Order {trade.order_id[:8]} not found in live orders (may be filled or already cancelled)"
+                return result
+
+            # Cancel the order
+            account.delete_order(self.session, trade.order_id)
+
+            trade.order_status = "cancelled"
+            trade.status = TradeStatus.APPROVED  # Reset to approved so it can be resubmitted
+
+            result["success"] = True
+            result["message"] = f"Order {trade.order_id[:8]} cancelled. Trade is now approved and can be resubmitted."
+            result["order_id"] = trade.order_id
+            logger.info(f"Cancelled order {trade.order_id} for trade {trade.id}")
+
+            return result
+
+        except Exception as e:
+            logger.error(f"Failed to cancel order: {e}")
+            result["message"] = f"Failed to cancel order: {e}"
+            return result
+
+    async def replace_order(self, trade_id: str, new_price: Decimal) -> Dict[str, Any]:
+        """
+        Replace a working order with a new limit price.
+        This cancels the existing order and submits a new one.
+
+        Args:
+            trade_id: The trade proposal ID
+            new_price: The new limit price
+
+        Returns:
+            Dict with success status and message
+        """
+        result = {"success": False, "message": ""}
+
+        # Find the trade
+        trade = None
+        for t in self.pending_trades + self.trade_history:
+            if t.id.startswith(trade_id) or t.id == trade_id:
+                trade = t
+                break
+
+        if not trade:
+            result["message"] = f"Trade {trade_id} not found"
+            return result
+
+        if trade.order_status != "working":
+            result["message"] = f"Order is not working (status: {trade.order_status})"
+            return result
+
+        # Cancel existing order
+        cancel_result = await self.cancel_order(trade_id)
+        if not cancel_result["success"]:
+            result["message"] = f"Failed to cancel existing order: {cancel_result['message']}"
+            return result
+
+        # Update limit price
+        old_price = trade.get_limit_price()
+        trade.set_limit_price(new_price)
+
+        # Re-execute the trade
+        success = await self.execute_trade(trade)
+
+        if success:
+            result["success"] = True
+            result["message"] = f"Order replaced: ${old_price:.2f} -> ${new_price:.2f}"
+            result["old_price"] = str(old_price)
+            result["new_price"] = str(new_price)
+            result["new_order_id"] = trade.order_id
+        else:
+            result["message"] = f"Order cancelled but failed to submit new order at ${new_price:.2f}"
+            result["old_price"] = str(old_price)
+            result["new_price"] = str(new_price)
+
+        return result
+
+    def get_trade_by_id(self, trade_id: str) -> Optional[TradeProposal]:
+        """
+        Get a trade proposal by ID.
+
+        Args:
+            trade_id: Full or partial trade ID
+
+        Returns:
+            TradeProposal or None if not found
+        """
+        for t in self.pending_trades + self.trade_history:
+            if t.id.startswith(trade_id) or t.id == trade_id:
+                return t
+        return None
+
     def export_state(self, filepath: str) -> bool:
         """Export bot state to JSON for persistence
 

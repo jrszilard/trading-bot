@@ -81,6 +81,12 @@ class ChatbotInterface:
         self.router.register_handler(TradingIntent.REJECT_TRADE, self._handle_reject)
         self.router.register_handler(TradingIntent.EXECUTE_TRADE, self._handle_execute)
 
+        # Order management
+        self.router.register_handler(TradingIntent.WORKING_ORDERS, self._handle_working_orders)
+        self.router.register_handler(TradingIntent.MODIFY_PRICE, self._handle_modify_price)
+        self.router.register_handler(TradingIntent.CANCEL_ORDER, self._handle_cancel_order)
+        self.router.register_handler(TradingIntent.CHECK_ORDER_STATUS, self._handle_order_status)
+
         # Portfolio queries
         self.router.register_handler(TradingIntent.GET_PORTFOLIO, self._handle_portfolio)
         self.router.register_handler(TradingIntent.GET_POSITIONS, self._handle_positions)
@@ -107,6 +113,8 @@ class ChatbotInterface:
         # Conversational
         self.router.register_handler(TradingIntent.HELP, self._handle_help)
         self.router.register_handler(TradingIntent.GENERAL_CHAT, self._handle_general_chat)
+        self.router.register_handler(TradingIntent.CLARIFICATION, self._handle_general_chat)
+        self.router.register_handler(TradingIntent.UNKNOWN, self._handle_general_chat)
         self.router.register_handler(TradingIntent.CONFIRM_YES, self._handle_confirm_yes)
         self.router.register_handler(TradingIntent.CONFIRM_NO, self._handle_confirm_no)
 
@@ -130,6 +138,11 @@ class ChatbotInterface:
         # Try quick pattern matching first
         parsed = self.router.parse_quick(user_input)
 
+        # Check for typos and suggest corrections if confidence is low
+        typo_corrections = []
+        if parsed.confidence < 0.6:
+            typo_corrections = self.router.suggest_typo_corrections(user_input)
+
         # If low confidence, try Claude NLU if available
         if parsed.confidence < 0.7 and self.bot.claude_advisor:
             try:
@@ -152,6 +165,12 @@ class ChatbotInterface:
             except Exception as e:
                 logger.debug(f"Claude NLU failed, using pattern match: {e}")
 
+        # Handle very low confidence with contextual suggestions
+        if parsed.confidence < 0.5 and parsed.intent == TradingIntent.GENERAL_CHAT:
+            response = self._generate_clarification_response(user_input, typo_corrections)
+            self.conversation.add_assistant_message(response, intent="clarification", entities={})
+            return response
+
         # Resolve references (e.g., "it", "that trade")
         self._resolve_references(parsed)
 
@@ -166,6 +185,16 @@ class ChatbotInterface:
         # Route to handler
         response = await self.router.route(parsed, context)
 
+        # For borderline confidence (0.5-0.75), prefix with interpretation
+        if 0.5 <= parsed.confidence < 0.75 and parsed.intent != TradingIntent.GENERAL_CHAT:
+            intent_desc = self.router.get_intent_description(parsed.intent)
+            response = f"(Interpreting as: {intent_desc})\n\n{response}"
+
+        # Add typo correction hint if found
+        if typo_corrections and parsed.confidence < 0.7:
+            corrections_hint = ", ".join(typo_corrections)
+            response = f"(Tip: Did you mean {corrections_hint}?)\n\n{response}"
+
         # Add assistant response to conversation
         self.conversation.add_assistant_message(
             response,
@@ -177,6 +206,40 @@ class ChatbotInterface:
         )
 
         return response
+
+    def _generate_clarification_response(
+        self,
+        user_input: str,
+        typo_corrections: list
+    ) -> str:
+        """
+        Generate a helpful clarification response when intent is unclear.
+
+        Provides contextual suggestions based on keywords in the input.
+        """
+        parts = ["I'm not sure what you meant."]
+
+        # Add typo correction suggestions
+        if typo_corrections:
+            corrections = ", ".join(typo_corrections)
+            parts.append(f"\nDid you mean: {corrections}?")
+
+        # Get contextual suggestions
+        suggestions = self.router.get_contextual_suggestions(user_input)
+
+        if suggestions:
+            parts.append("\n\nDid you want to:")
+            for suggestion in suggestions[:4]:
+                parts.append(f"  • {suggestion}")
+        else:
+            # Default suggestions if no context clues
+            parts.append("\n\nHere are some things I can help with:")
+            parts.append("  • 'scan SPY, QQQ' - Find trading opportunities")
+            parts.append("  • 'show portfolio' - View your account")
+            parts.append("  • 'show positions' - View current positions")
+            parts.append("  • 'help' - See all commands")
+
+        return "\n".join(parts)
 
     def _resolve_references(self, parsed: ParsedIntent) -> None:
         """Resolve pronoun and reference resolution"""
@@ -402,8 +465,21 @@ class ChatbotInterface:
         self.conversation.set_pending_action("execute", trade.id)
         self.conversation.context.set_state(ConversationState.AWAITING_EXECUTION)
 
+        # Show limit price for confirmation
+        limit_price = trade.get_limit_price()
         sandbox = "[SANDBOX] " if self.bot.sandbox_mode else ""
-        return f"{sandbox}Trade {trade.id[:8]} approved. Execute now? (yes/no)"
+
+        lines = [
+            f"{sandbox}Trade {trade.id[:8]} approved.",
+            "",
+            f"LIMIT PRICE: ${limit_price:.2f}",
+            "",
+            "Commands:",
+            "  'yes' or 'execute' - Submit the order at this price",
+            "  'set price X.XX'   - Change the limit price first",
+            "  'no' or 'cancel'   - Cancel without executing"
+        ]
+        return "\n".join(lines)
 
     async def _handle_reject(
         self,
@@ -474,6 +550,143 @@ class ChatbotInterface:
         return self.formatter.format_trade_confirmation(
             trade.id[:8], "execute", success, sandbox
         )
+
+    # =========================================================================
+    # ORDER MANAGEMENT HANDLERS
+    # =========================================================================
+
+    async def _handle_working_orders(
+        self,
+        parsed: ParsedIntent,
+        context: Optional[Dict[str, Any]] = None
+    ) -> str:
+        """Handle request to show working (unfilled) orders"""
+        working = self.bot.get_working_orders()
+
+        if not working:
+            return "No working orders. All submitted orders have been filled or cancelled."
+
+        # Convert to dicts for formatting
+        orders = []
+        for t in working:
+            orders.append({
+                'id': t.id,
+                'underlying_symbol': t.underlying_symbol,
+                'strategy': t.strategy.value if hasattr(t.strategy, 'value') else str(t.strategy),
+                'expected_credit': float(t.expected_credit),
+                'limit_price': float(t.get_limit_price()),
+                'order_id': t.order_id,
+                'order_status': t.order_status
+            })
+
+        return self.formatter.format_working_orders(orders)
+
+    async def _handle_modify_price(
+        self,
+        parsed: ParsedIntent,
+        context: Optional[Dict[str, Any]] = None
+    ) -> str:
+        """Handle request to modify limit price for a trade"""
+        from decimal import Decimal
+
+        trade_id = parsed.trade_id
+        params = parsed.parameters or {}
+        new_price = params.get('new_price')
+
+        if not trade_id:
+            # Try to find the trade if only one pending/approved trade
+            pending = [t for t in self.bot.pending_trades
+                      if t.status in [TradeStatus.PENDING_APPROVAL, TradeStatus.APPROVED]]
+            if len(pending) == 1:
+                trade_id = pending[0].id
+            elif len(pending) == 0:
+                return "No pending trades to modify. Approve a trade first."
+            else:
+                return f"Multiple pending trades. Specify which one: {', '.join(t.id[:8] for t in pending)}"
+
+        if not new_price:
+            # Show current price and ask for new one
+            trade = self.bot.get_trade_by_id(trade_id)
+            if not trade:
+                return f"Trade {trade_id} not found."
+            current = trade.get_limit_price()
+            return f"Current limit price for {trade_id[:8]}: ${current:.2f}\nUse 'set price <amount>' to change it."
+
+        result = self.bot.modify_limit_price(trade_id, Decimal(str(new_price)))
+
+        if result['success']:
+            return result['message']
+        else:
+            return f"Failed to modify price: {result['message']}"
+
+    async def _handle_cancel_order(
+        self,
+        parsed: ParsedIntent,
+        context: Optional[Dict[str, Any]] = None
+    ) -> str:
+        """Handle request to cancel a working order"""
+        trade_id = parsed.trade_id
+
+        if not trade_id:
+            # Try to find working orders
+            working = self.bot.get_working_orders()
+            if len(working) == 0:
+                return "No working orders to cancel."
+            elif len(working) == 1:
+                trade_id = working[0].id
+            else:
+                return f"Multiple working orders. Specify which one: {', '.join(t.id[:8] for t in working)}"
+
+        result = await self.bot.cancel_order(trade_id)
+
+        if result['success']:
+            return result['message']
+        else:
+            return f"Failed to cancel order: {result['message']}"
+
+    async def _handle_order_status(
+        self,
+        parsed: ParsedIntent,
+        context: Optional[Dict[str, Any]] = None
+    ) -> str:
+        """Handle request to check order status"""
+        trade_id = parsed.trade_id
+
+        if not trade_id:
+            # Try to find working orders
+            working = self.bot.get_working_orders()
+            if len(working) == 0:
+                return "No working orders to check."
+            elif len(working) == 1:
+                trade_id = working[0].id
+            else:
+                return f"Multiple working orders. Specify which one: {', '.join(t.id[:8] for t in working)}"
+
+        status = await self.bot.check_order_status(trade_id)
+
+        if not status:
+            return f"Could not find order for trade {trade_id}"
+
+        lines = [
+            f"Order Status: {trade_id[:8]}",
+            "-" * 30,
+            f"Status:      {status.get('status', 'unknown').upper()}",
+            f"Limit Price: ${float(status.get('limit_price', 0)):.2f}",
+        ]
+
+        if status.get('order_id'):
+            lines.append(f"Order ID:    {status['order_id'][:8]}")
+
+        if status.get('filled_quantity'):
+            lines.append(f"Filled:      {status['filled_quantity']}")
+
+        if status.get('remaining_quantity'):
+            lines.append(f"Remaining:   {status['remaining_quantity']}")
+
+        if status.get('error'):
+            lines.append(f"Error:       {status['error']}")
+
+        return "\n".join(lines)
 
     async def _handle_create_trade(
         self,
@@ -1043,6 +1256,7 @@ class ChatbotInterface:
         context: Dict[str, Any]
     ) -> str:
         """Handle general trading chat/questions"""
+        # If Claude is available, try to generate a helpful response
         if self.bot.claude_advisor and self.bot.claude_advisor.is_available:
             try:
                 response = await self.bot.claude_advisor.generate_conversational_response(
@@ -1059,7 +1273,23 @@ class ChatbotInterface:
             except Exception as e:
                 logger.error(f"General chat error: {e}")
 
-        return "I'm not sure how to help with that. Type 'help' to see available commands."
+        # Fallback: provide contextual suggestions
+        suggestions = self.router.get_contextual_suggestions(parsed.raw_text)
+
+        if suggestions:
+            lines = ["I'm not sure what you're asking. Did you want to:"]
+            for suggestion in suggestions[:4]:
+                lines.append(f"  • {suggestion}")
+            lines.append("\nType 'help' for all available commands.")
+            return "\n".join(lines)
+
+        # Default fallback
+        return ("I'm not sure how to help with that.\n\n"
+                "Try commands like:\n"
+                "  • 'scan SPY' - Find opportunities\n"
+                "  • 'show portfolio' - View account\n"
+                "  • 'show positions' - View positions\n"
+                "  • 'help' - See all commands")
 
     async def _handle_confirm_yes(
         self,

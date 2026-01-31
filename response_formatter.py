@@ -98,6 +98,7 @@ class ResponseFormatter:
         symbol = trade.get('underlying_symbol', 'Unknown')
         strategy = trade.get('strategy', 'Unknown')
         credit = trade.get('expected_credit', 0)
+        limit_price = trade.get('limit_price') or credit  # Use limit_price if set, otherwise credit
         max_loss = trade.get('max_loss', 0)
         pop = trade.get('probability_of_profit', 0)
         iv_rank = trade.get('iv_rank', 0)
@@ -105,15 +106,21 @@ class ResponseFormatter:
         delta = trade.get('delta', 0)
         theta = trade.get('theta', 0)
         legs = trade.get('legs', [])
+        status = trade.get('status', 'pending')
+        order_status = trade.get('order_status')
 
         lines = [
             f"Trade Proposal [{trade_id}]",
             "=" * 40,
             f"Symbol:   {symbol}",
             f"Strategy: {strategy}",
-            "",
-            "Legs:"
+            f"Status:   {status}",
         ]
+
+        if order_status:
+            lines.append(f"Order:    {order_status.upper()}")
+
+        lines.extend(["", "Legs:"])
 
         for leg in legs:
             action = leg.get('action', 'SELL')
@@ -125,8 +132,18 @@ class ResponseFormatter:
 
         lines.extend([
             "",
-            "Metrics:",
-            f"  Credit:      ${credit:.2f}",
+            "Pricing:",
+            f"  Expected Credit: ${credit:.2f}",
+            f"  LIMIT PRICE:     ${limit_price:.2f}  <-- Order will execute at this price",
+        ])
+
+        # Show if limit price differs from expected credit
+        if trade.get('limit_price') and abs(float(limit_price) - float(credit)) > 0.001:
+            lines.append(f"  (Modified from expected ${credit:.2f})")
+
+        lines.extend([
+            "",
+            "Risk:",
             f"  Max Loss:    ${max_loss:.2f}",
             f"  IV Rank:     {iv_rank:.1f}%",
             f"  DTE:         {dte} days",
@@ -135,6 +152,64 @@ class ResponseFormatter:
             "Greeks:",
             f"  Delta: {delta:+.3f}",
             f"  Theta: {theta:+.3f}",
+        ])
+
+        return "\n".join(lines)
+
+    def format_working_orders(self, orders: List[Dict[str, Any]]) -> str:
+        """Format list of working (unfilled) orders"""
+        if not orders:
+            return "No working orders."
+
+        lines = ["Working Orders (Unfilled)", "-" * 50]
+
+        for order in orders:
+            trade_id = order.get('id', 'Unknown')[:8]
+            symbol = order.get('underlying_symbol', 'Unknown')
+            strategy = order.get('strategy', 'Unknown')
+            limit_price = order.get('limit_price') or order.get('expected_credit', 0)
+            order_id = order.get('order_id', 'N/A')
+            order_status = order.get('order_status', 'working')
+
+            lines.append(f"  [{trade_id}] {symbol} {strategy}")
+            lines.append(f"       Limit: ${limit_price:.2f} | Order ID: {order_id[:8] if order_id else 'N/A'}")
+            lines.append(f"       Status: {order_status.upper()}")
+            lines.append("")
+
+        lines.append("Use 'modify price <id> <new_price>' to adjust limit price")
+        lines.append("Use 'cancel order <id>' to cancel the order")
+        return "\n".join(lines)
+
+    def format_price_confirmation(self, trade: Dict[str, Any]) -> str:
+        """Format limit price confirmation before execution"""
+        trade_id = trade.get('id', 'Unknown')[:8]
+        symbol = trade.get('underlying_symbol', 'Unknown')
+        strategy = trade.get('strategy', 'Unknown')
+        credit = trade.get('expected_credit', 0)
+        limit_price = trade.get('limit_price') or credit
+
+        lines = [
+            "=" * 45,
+            "        CONFIRM LIMIT ORDER PRICE",
+            "=" * 45,
+            "",
+            f"Trade:     [{trade_id}] {symbol} {strategy}",
+            "",
+            f"LIMIT PRICE: ${limit_price:.2f}",
+            "",
+        ]
+
+        if limit_price != credit:
+            lines.append(f"(Expected credit was ${credit:.2f})")
+            lines.append("")
+
+        lines.extend([
+            "This order will execute at or better than the limit price.",
+            "",
+            "Commands:",
+            "  'execute' or 'confirm' - Submit the order",
+            "  'set price <amount>'   - Change the limit price",
+            "  'cancel'               - Cancel without executing",
         ])
 
         return "\n".join(lines)
@@ -307,6 +382,12 @@ Trade Management:
   "Reject trade abc123"
   "Execute the approved trade"
 
+Order Management:
+  "Show working orders"     - View unfilled limit orders
+  "Set price 2.50"          - Modify limit price before execution
+  "Check order status"      - Check if order is filled
+  "Cancel order abc123"     - Cancel an unfilled order
+
 Portfolio:
   "What's my portfolio delta?"
   "Show my positions"
@@ -329,7 +410,10 @@ The bot follows tastylive methodology:
 - Target 45 DTE entries
 - 30 delta standard, 16 delta conservative
 - Take profit at 50%
-- Manage at 21 DTE"""
+- Manage at 21 DTE
+
+All orders execute as LIMIT orders. You can confirm
+and modify the limit price before execution."""
 
     def format_error(self, message: str) -> str:
         """Format error message"""
