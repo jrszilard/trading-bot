@@ -380,5 +380,12 @@
       "confirm_before_execute": true,
       "warn_on_large_positions": true
     }
+  },
+
+  "display": {
+    "_comment": "Rich CLI display settings. Set rich_enabled to false for plain text (debugging/logging)",
+    "rich_enabled": true,
+    "default_layout": "auto",
+    "_layout_options": ["auto", "table", "cards", "compact"]
   }
 }

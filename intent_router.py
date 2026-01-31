@@ -70,6 +70,10 @@ class TradingIntent(Enum):
     CONFIRM_YES = "confirm_yes"
     CONFIRM_NO = "confirm_no"
 
+    # Display settings
+    SET_DISPLAY_MODE = "set_display_mode"
+    SET_LAYOUT = "set_layout"
+
     # Unknown
     UNKNOWN = "unknown"
 
@@ -546,6 +550,26 @@ class IntentRouter:
                 intent=TradingIntent.GET_RISK_PARAMS,
                 confidence=0.85,
                 raw_text=text
+            )
+
+        # Display mode settings (/plain, /rich, etc.)
+        if self._matches_display_mode(text_lower):
+            mode = self._extract_display_mode(text_lower)
+            return ParsedIntent(
+                intent=TradingIntent.SET_DISPLAY_MODE,
+                confidence=0.95,
+                raw_text=text,
+                parameters={'mode': mode}
+            )
+
+        # Layout settings (/layout table, etc.)
+        if self._matches_layout(text_lower):
+            layout = self._extract_layout(text_lower)
+            return ParsedIntent(
+                intent=TradingIntent.SET_LAYOUT,
+                confidence=0.95,
+                raw_text=text,
+                parameters={'layout': layout}
             )
 
         # If we have a symbol and nothing else matched, might be a query about it
@@ -1138,6 +1162,49 @@ class IntentRouter:
                     continue
 
         return params
+
+    def _matches_display_mode(self, text: str) -> bool:
+        """Match display mode commands (/plain, /rich, etc.)"""
+        patterns = [
+            r'^/plain\b', r'^/rich\b', r'^/display\b',
+            r'^plain\s*mode', r'^rich\s*mode', r'^text\s*mode',
+            r'(switch|change)\s+(to\s+)?(plain|rich|text)\s*(mode|display)?',
+            r'(turn|switch)\s+(off|on)\s+(rich|formatting)',
+            r'(disable|enable)\s+(rich|formatting)',
+            r'(no|without)\s+(formatting|colors)',
+            r'plain\s*text', r'debug\s*mode'
+        ]
+        return any(re.search(p, text, re.IGNORECASE) for p in patterns)
+
+    def _extract_display_mode(self, text: str) -> str:
+        """Extract display mode from text (plain/rich)"""
+        text_lower = text.lower()
+        if any(word in text_lower for word in ['plain', 'text', 'debug', 'off', 'disable', 'no ', 'without']):
+            return 'plain'
+        elif any(word in text_lower for word in ['rich', 'on', 'enable', 'color']):
+            return 'rich'
+        return 'toggle'  # Default to toggle
+
+    def _matches_layout(self, text: str) -> bool:
+        """Match layout commands (/layout table, etc.)"""
+        patterns = [
+            r'^/layout\b',
+            r'(set|change|switch)\s+(to\s+)?(layout|display)\s+(to\s+)?(table|cards?|compact|auto)',
+            r'(use|show)\s+(table|cards?|compact|auto)\s*(layout|view|mode)?',
+            r'(table|cards?|compact|auto)\s+(layout|view|mode|display)'
+        ]
+        return any(re.search(p, text, re.IGNORECASE) for p in patterns)
+
+    def _extract_layout(self, text: str) -> str:
+        """Extract layout type from text"""
+        text_lower = text.lower()
+        if 'table' in text_lower:
+            return 'table'
+        elif 'card' in text_lower:
+            return 'cards'
+        elif 'compact' in text_lower:
+            return 'compact'
+        return 'auto'
 
     async def route(
         self,

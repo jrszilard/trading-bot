@@ -28,6 +28,7 @@ from intent_router import IntentRouter, TradingIntent, ParsedIntent
 from response_formatter import ResponseFormatter
 from research import ResearchEngine
 from position_monitor import PositionMonitor, ManagementAlert
+from rich_display import RichDisplay
 
 # Import trading bot components
 from trading_bot import TastytradeBot
@@ -60,6 +61,13 @@ class ChatbotInterface:
         self.router = IntentRouter()
         self.formatter = ResponseFormatter()
         self.research = ResearchEngine(bot)
+
+        # Initialize Rich display from config
+        display_config = getattr(bot, 'config', {}).get('display', {})
+        self.display = RichDisplay(
+            enabled=display_config.get('rich_enabled', True),
+            default_layout=display_config.get('default_layout', 'auto')
+        )
 
         # Position monitor (initialized in run())
         self.position_monitor: Optional[PositionMonitor] = None
@@ -117,6 +125,10 @@ class ChatbotInterface:
         self.router.register_handler(TradingIntent.UNKNOWN, self._handle_general_chat)
         self.router.register_handler(TradingIntent.CONFIRM_YES, self._handle_confirm_yes)
         self.router.register_handler(TradingIntent.CONFIRM_NO, self._handle_confirm_no)
+
+        # Display settings
+        self.router.register_handler(TradingIntent.SET_DISPLAY_MODE, self._handle_display_mode)
+        self.router.register_handler(TradingIntent.SET_LAYOUT, self._handle_layout)
 
     async def process_message(self, user_input: str) -> str:
         """
@@ -299,29 +311,30 @@ class ChatbotInterface:
 
             # If no approved opportunities but candidates exist, show filtered candidates
             if not opportunities and all_candidates:
-                response_parts = [
-                    f"{data_source}Found {len(all_candidates)} potential strateg{'y' if len(all_candidates) == 1 else 'ies'}:",
-                    ""
-                ]
-
+                # Convert candidates to display format
+                filtered_results = []
                 for candidate in all_candidates:
-                    opt_num = candidate['option_number']
-                    strategy = candidate['strategy']
-                    symbol = candidate['symbol']
-                    credit = candidate['credit']
-                    max_loss = candidate['max_loss']
-                    pop = candidate['pop']
-                    kelly = candidate['kelly_score']
+                    filtered_results.append({
+                        'id': f"candidate-{candidate['option_number']}",
+                        'underlying_symbol': candidate['symbol'],
+                        'strategy': candidate['strategy'],
+                        'iv_rank': candidate.get('iv_rank', 0),
+                        'delta': candidate.get('delta', 0),
+                        'dte': candidate.get('dte', 45),
+                        'expected_credit': candidate['credit'],
+                        'max_loss': candidate['max_loss'],
+                        'probability_of_profit': candidate['pop'],
+                        'theta': candidate.get('theta', 0),
+                        'kelly_score': candidate['kelly_score'],
+                        'option_number': candidate['option_number']
+                    })
 
-                    response_parts.append(
-                        f"{opt_num}. {strategy} on {symbol}\n"
-                        f"   Credit: ${credit:.2f} | Max Loss: ${max_loss:.2f}\n"
-                        f"   POP: {pop:.0%} | Kelly: {kelly:.3f}"
-                    )
-
-                response_parts.append("")
-                response_parts.append("These were filtered by risk criteria. To create one anyway, say 'option [number]'.")
-                return "\n".join(response_parts)
+                # Use RichDisplay for filtered candidates
+                return self.display.render_filtered_candidates(
+                    filtered_results,
+                    symbols,
+                    data_source=data_source
+                )
 
             if not opportunities:
                 return f"{data_source}No opportunities found on {', '.join(symbols)} meeting criteria."
@@ -337,10 +350,13 @@ class ChatbotInterface:
                     'delta': float(opp.delta),
                     'dte': opp.dte,
                     'expected_credit': float(opp.expected_credit),
-                    'max_loss': float(opp.max_loss)
+                    'max_loss': float(opp.max_loss),
+                    'probability_of_profit': float(opp.probability_of_profit),
+                    'theta': float(opp.theta) if hasattr(opp, 'theta') else 0.0
                 })
 
-            return self.formatter.format_scan_results(results, symbols)
+            # Use RichDisplay for formatted output
+            return self.display.render_scan_results(results, symbols, data_source=data_source)
 
         except Exception as e:
             logger.error(f"Scan error: {e}")
@@ -420,13 +436,15 @@ class ChatbotInterface:
                 'expected_credit': float(t.expected_credit),
                 'max_loss': float(t.max_loss),
                 'iv_rank': float(t.iv_rank),
-                'dte': t.dte
+                'dte': t.dte,
+                'status': t.status.value if hasattr(t.status, 'value') else str(t.status)
             })
 
             # Track most recent trade for reference resolution
             self.conversation.context.entities.trade_id = t.id
 
-        return self.formatter.format_pending_trades(trades)
+        # Use RichDisplay for formatted output
+        return self.display.render_pending_trades(trades)
 
     async def _handle_approve(
         self,
@@ -579,7 +597,8 @@ class ChatbotInterface:
                 'order_status': t.order_status
             })
 
-        return self.formatter.format_working_orders(orders)
+        # Use RichDisplay for formatted output
+        return self.display.render_working_orders(orders)
 
     async def _handle_modify_price(
         self,
@@ -814,11 +833,15 @@ class ChatbotInterface:
             'buying_power': float(self.bot.portfolio_state.buying_power),
             'portfolio_delta': float(self.bot.portfolio_state.portfolio_delta),
             'portfolio_theta': float(self.bot.portfolio_state.portfolio_theta),
+            'portfolio_vega': float(self.bot.portfolio_state.portfolio_vega),
+            'portfolio_gamma': float(self.bot.portfolio_state.portfolio_gamma),
             'open_positions': self.bot.portfolio_state.open_positions,
-            'daily_pnl': float(self.bot.portfolio_state.daily_pnl)
+            'daily_pnl': float(self.bot.portfolio_state.daily_pnl),
+            'weekly_pnl': float(self.bot.portfolio_state.weekly_pnl)
         }
 
-        return self.formatter.format_portfolio_summary(portfolio_data)
+        # Use RichDisplay for formatted output
+        return self.display.render_portfolio(portfolio_data)
 
     async def _handle_positions(
         self,
@@ -1377,6 +1400,35 @@ class ChatbotInterface:
         return "Okay, cancelled. What would you like to do?"
 
     # =========================================================================
+    # Display Settings Handlers
+    # =========================================================================
+
+    async def _handle_display_mode(
+        self,
+        parsed: ParsedIntent,
+        context: Dict[str, Any]
+    ) -> str:
+        """Handle display mode change (/plain, /rich)"""
+        mode = parsed.parameters.get('mode', 'toggle')
+
+        if mode == 'plain':
+            return self.display.toggle(False)
+        elif mode == 'rich':
+            return self.display.toggle(True)
+        else:
+            # Toggle current state
+            return self.display.toggle()
+
+    async def _handle_layout(
+        self,
+        parsed: ParsedIntent,
+        context: Dict[str, Any]
+    ) -> str:
+        """Handle layout change (/layout table, etc.)"""
+        layout = parsed.parameters.get('layout', 'auto')
+        return self.display.set_layout(layout)
+
+    # =========================================================================
     # Main Run Loop
     # =========================================================================
 
@@ -1385,17 +1437,31 @@ class ChatbotInterface:
         if not alerts:
             return
 
-        print("\n" + "=" * 60)
-        print("POSITION ALERTS")
-        print("=" * 60)
+        if self.display.enabled and self.display.console:
+            self.display.console.print()
+            self.display.console.print("[bold yellow]" + "=" * 60 + "[/bold yellow]")
+            self.display.console.print("[bold yellow]POSITION ALERTS[/bold yellow]")
+            self.display.console.print("[bold yellow]" + "=" * 60 + "[/bold yellow]")
 
-        for alert in alerts:
-            formatted = self.formatter.format_alert(alert)
-            print(formatted)
-            print("-" * 40)
+            for alert in alerts:
+                self.display.render_alert(alert)
 
-        print("Use 'close <symbol>' or 'roll <symbol>' to take action")
-        print("=" * 60 + "\n")
+            self.display.console.print()
+            self.display.console.print("[dim]Use 'close <symbol>' or 'roll <symbol>' to take action[/dim]")
+            self.display.console.print("[bold yellow]" + "=" * 60 + "[/bold yellow]")
+            self.display.console.print()
+        else:
+            print("\n" + "=" * 60)
+            print("POSITION ALERTS")
+            print("=" * 60)
+
+            for alert in alerts:
+                formatted = self.formatter.format_alert(alert)
+                print(formatted)
+                print("-" * 40)
+
+            print("Use 'close <symbol>' or 'roll <symbol>' to take action")
+            print("=" * 60 + "\n")
 
     async def run(self) -> None:
         """Main chatbot run loop"""
@@ -1415,6 +1481,8 @@ class ChatbotInterface:
             mode_parts.append("PRODUCTION")
         if self.bot.use_mock_data:
             mode_parts.append("MOCK DATA")
+        if self.display.enabled:
+            mode_parts.append("RICH DISPLAY")
         if self.bot.claude_advisor and self.bot.claude_advisor.is_available:
             mode_parts.append("CLAUDE AI")
 
@@ -1457,8 +1525,14 @@ class ChatbotInterface:
                     # Process and respond
                     response = await self.process_message(user_input)
 
+                    # Rich display methods print directly and return ""
+                    # Plain text responses are returned as strings
                     if response:
+                        # Plain text response - print with Bot: prefix
                         print(f"\nBot: {response}\n")
+                    else:
+                        # Rich already printed output, just add trailing newline
+                        print()
 
                 except KeyboardInterrupt:
                     print("\n\nBot: Interrupted. Goodbye!")

@@ -405,6 +405,14 @@ Other:
   "How's the market looking?"
   "help" - Show this message
 
+Display Settings:
+  "/plain"              - Switch to plain text mode (for debugging)
+  "/rich"               - Switch to Rich formatted display
+  "/layout table"       - Use table layout for scan results
+  "/layout cards"       - Use card layout for detailed view
+  "/layout compact"     - Use compact one-line summaries
+  "/layout auto"        - Auto-select based on result count
+
 The bot follows tastylive methodology:
 - Sell premium when IV Rank > 30%
 - Target 45 DTE entries

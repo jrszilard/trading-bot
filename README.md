@@ -48,11 +48,13 @@ This bot follows the tastylive trading methodology developed by Tom Sosnoff and 
 cd tastytrade-bot
 
 # Install dependencies
-pip install tastytrade
+pip install tastytrade rich
 
 # Or install the official SDK
-pip install tastytrade-sdk
+pip install tastytrade-sdk rich
 ```
+
+> **Note:** The `rich` library is optional but recommended for enhanced CLI display. The bot falls back to plain text if Rich is not installed.
 
 ## Configuration
 
@@ -102,6 +104,83 @@ risk            - Show risk parameters
 history         - Show trade history
 export          - Export state to file
 quit            - Exit
+```
+
+## Rich Display
+
+The bot features a Rich-powered CLI with color-coded tables, panels, and formatted output. This can be toggled on/off for debugging or logging purposes.
+
+### Display Modes
+
+| Mode | Description |
+|------|-------------|
+| **Rich** (default) | Color-coded tables, panels, and formatted output |
+| **Plain** | Simple text output for debugging/logging |
+
+### Layout Options
+
+| Layout | Best For | Description |
+|--------|----------|-------------|
+| `auto` | General use | Automatically selects based on result count |
+| `table` | Many results | Compact table view for quick scanning |
+| `cards` | Few results | Detailed card view with all metrics |
+| `compact` | 10+ results | One-line summaries for rapid review |
+
+### Display Commands
+
+```bash
+/plain              # Switch to plain text mode
+/rich               # Switch to Rich formatted display
+/layout table       # Use table layout
+/layout cards       # Use detailed card layout
+/layout compact     # Use compact one-line summaries
+/layout auto        # Auto-select based on result count
+```
+
+### Configuration
+
+Edit `config.json` to set display defaults:
+
+```json
+{
+  "display": {
+    "rich_enabled": true,
+    "default_layout": "auto"
+  }
+}
+```
+
+### Environment Variable
+
+Disable Rich display via environment variable (useful for CI/logging):
+
+```bash
+RICH_DISABLED=1 python chatbot.py
+```
+
+### Sample Output
+
+**Table Layout:**
+```
+╭───┬──────────┬────────┬──────────────────┬─────────┬────────┬───────┬─────────╮
+│ # │ ID       │ Symbol │ Strategy         │ IV Rank │ Credit │ DTE   │ P.O.P   │
+├───┼──────────┼────────┼──────────────────┼─────────┼────────┼───────┼─────────┤
+│ 1 │ abc12345 │ SPY    │ Short Put Spread │ 42.5%   │ $1.25  │ 45    │ 72%     │
+│ 2 │ def98765 │ QQQ    │ Iron Condor      │ 38.2%   │ $2.10  │ 42    │ 68%     │
+╰───┴──────────┴────────┴──────────────────┴─────────┴────────┴───────┴─────────╯
+```
+
+**Card Layout:**
+```
+╭─ #1 abc12345 SPY ─────────────────────────────────────────────╮
+│ Strategy: Short Put Spread                                    │
+│ Strikes: 580/575                                              │
+│                                                               │
+│ IV Rank: 42.5%  |  Delta: -0.28  |  DTE: 45                  │
+│ Credit: $1.25   |  Max Loss: $375  |  Theta: +$0.045/day     │
+│                                                               │
+│ P.O.P: 72%  |  Return on Risk: 33.3%                         │
+╰───────────────────────────────────────────────────────────────╯
 ```
 
 ### Example Session
@@ -225,9 +304,19 @@ await bot.execute_trade(proposal)         # Executes if approved
 
 ```
 tastytrade-bot/
-├── trading_bot.py      # Main bot implementation
+├── chatbot.py          # Natural language chatbot interface
+├── trading_bot.py      # Core trading bot implementation
+├── intent_router.py    # NLP intent classification
+├── strategy_engine.py  # Multi-strategy evaluation
+├── claude_advisor.py   # Claude AI integration
+├── rich_display.py     # Rich CLI display formatting
+├── response_formatter.py # Plain text response formatting
+├── position_monitor.py # Background position alerts
+├── conversation.py     # Multi-turn conversation state
+├── research.py         # Market research engine
+├── models.py           # Core data models
 ├── config.json         # Configuration parameters
-├── README.md          # This documentation
+├── README.md           # This documentation
 └── requirements.txt    # Python dependencies
 ```
 
